@@ -7,6 +7,7 @@ Windows-Audio-Schnittstelle (WASAPI-Loopback) aufgenommen.
 """
 from __future__ import annotations
 
+import atexit
 import ctypes
 import datetime as dt
 import io
@@ -14,6 +15,8 @@ import json
 import os
 import queue
 import re
+import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -37,15 +40,13 @@ from pypdf import PdfReader
 # ---------------------------------------------------------------------------
 APP_TITLE = "Gesprächsnotiz-AI – Vorlesungsnotizen"
 WHISPER_MODEL_DIR = Path(__file__).resolve().parent / "runtime" / "whisper"
-LOCAL_AI_URL = "http://127.0.0.1:9931/v1/chat/completions"
+LLAMA_DIR = Path(__file__).resolve().parent / "runtime" / "llama"
+MODELS_DIR = LLAMA_DIR / "Modelle"
+BUNDLED_MODEL = "qwen2.5-0.5b-instruct-q4_k_m.gguf"
+BUNDLED_AI_URL = "http://127.0.0.1:9931/v1/chat/completions"  # startet GespraechsnotizAI.exe
 SUPPORTED_AUDIO = ("wav", "mp3", "m4a", "mpeg", "mpga", "webm", "ogg")
 MAX_DOCUMENT_CHARS = 120_000
 
-# Der mitgelieferte KI-Server läuft mit nur 2048 Tokens Kontext.
-# Deshalb werden lange Texte in kleine Abschnitte zerlegt.
-CHUNK_CHARS = 2400
-NOTES_MAX_TOKENS = 450
-SUMMARY_MAX_TOKENS = 600
 
 RECORD_RATE = 16_000  # Whisper arbeitet intern mit 16 kHz mono
 
@@ -54,6 +55,29 @@ RECORDINGS_DIR = DATA_DIR / "Aufnahmen"
 NOTES_DIR = DATA_DIR / "Notizen"
 
 st.set_page_config(page_title="Gesprächsnotiz-AI", page_icon="🎓", layout="wide")
+
+
+class AIConfig:
+    """Aktuelle KI-Einstellungen. Die Abschnittsgröße richtet sich nach dem Kontextfenster des Modells."""
+
+    def __init__(self) -> None:
+        self.configure(BUNDLED_AI_URL, 2048, "Qwen 2.5 0.5B (mitgeliefert)")
+
+    def configure(self, url: str, context: int, label: str) -> None:
+        self.url, self.context, self.label = url, context, label
+        if context <= 2048:  # mitgeliefertes Modell: sehr kleine Abschnitte
+            self.notes_tokens, self.summary_tokens, self.chunk_chars = 450, 600, 2400
+        else:
+            self.notes_tokens, self.summary_tokens = 700, 1200
+            self.chunk_chars = min(20_000, int((context - self.notes_tokens - 400) * 2.2))
+
+
+@st.cache_resource
+def get_ai_config() -> AIConfig:
+    return AIConfig()
+
+
+AI = get_ai_config()
 
 
 # ---------------------------------------------------------------------------
@@ -631,6 +655,105 @@ def extract_documents(files: Iterable) -> tuple[str, list[str]]:
 # ---------------------------------------------------------------------------
 # Lokale KI (llama.cpp-Server)
 # ---------------------------------------------------------------------------
+class ModelServer:
+    """Startet den mitgelieferten llama-server zusätzlich mit einem größeren Modell und mehr Kontext."""
+
+    def __init__(self) -> None:
+        self.process: subprocess.Popen | None = None
+        self.model: Path | None = None
+        self.context = 0
+        self.port = 0
+        atexit.register(self.stop)
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.port}/v1/chat/completions"
+
+    def running_with(self, model: Path, context: int) -> bool:
+        return (self.process is not None and self.process.poll() is None
+                and self.model == model and self.context == context)
+
+    def ensure(self, model: Path, context: int) -> str:
+        if self.running_with(model, context):
+            return self.url
+        self.stop()
+        exe = LLAMA_DIR / "Programm" / "llama-server.exe"
+        if not exe.is_file():
+            raise FileNotFoundError(f"KI-Server nicht gefunden: {exe}")
+        self.port = _free_port(9932)
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        log_path = DATA_DIR / "ki-server.log"
+        threads = max(1, (os.cpu_count() or 2) // 2)  # ≈ Anzahl echter Prozessorkerne
+        command = [str(exe), "-m", str(model), "--host", "127.0.0.1", "--port", str(self.port),
+                   "-c", str(context), "-np", "1", "-t", str(threads), "--alias", model.name]
+        with open(log_path, "w", encoding="utf-8") as log:
+            # Kein eigenes Fenster, aber an der Konsole des Programms: schließt sich mit ihr.
+            self.process = subprocess.Popen(command, cwd=str(exe.parent), stdout=log,
+                                            stderr=subprocess.STDOUT)
+        self.model, self.context = model, context
+        deadline = time.time() + 300  # große Modelle brauchen eine Weile zum Laden
+        while time.time() < deadline:
+            if self.process.poll() is not None:
+                self.process = None
+                tail = log_path.read_text(encoding="utf-8", errors="replace")[-600:]
+                raise RuntimeError(f"Der KI-Server ist beim Laden abgebrochen. Zu wenig Arbeitsspeicher? "
+                                   f"Auszug aus {log_path}:\n{tail}")
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/health", timeout=2) as resp:
+                    if resp.status == 200:
+                        return self.url
+            except Exception:
+                pass
+            time.sleep(1)
+        self.stop()
+        raise TimeoutError("Das Modell wurde nicht innerhalb von 5 Minuten geladen.")
+
+    def stop(self) -> None:
+        if self.process is not None and self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+        self.process = None
+        self.model = None
+
+
+def _free_port(start: int) -> int:
+    for port in range(start, start + 20):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            if sock.connect_ex(("127.0.0.1", port)) != 0:
+                return port
+    raise RuntimeError("Kein freier Netzwerk-Port für den KI-Server gefunden.")
+
+
+def total_ram_gb() -> float:
+    try:
+        class _MemStatus(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_uint32), ("dwMemoryLoad", ctypes.c_uint32),
+                        ("ullTotalPhys", ctypes.c_uint64), ("ullAvailPhys", ctypes.c_uint64),
+                        ("ullTotalPageFile", ctypes.c_uint64), ("ullAvailPageFile", ctypes.c_uint64),
+                        ("ullTotalVirtual", ctypes.c_uint64), ("ullAvailVirtual", ctypes.c_uint64),
+                        ("ullAvailExtendedVirtual", ctypes.c_uint64)]
+        status = _MemStatus()
+        status.dwLength = ctypes.sizeof(status)
+        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status))
+        return status.ullTotalPhys / 1024 ** 3
+    except Exception:
+        return 0.0
+
+
+@st.cache_resource
+def get_model_server() -> ModelServer:
+    return ModelServer()
+
+
+def model_label(path: Path) -> str:
+    if path.name == BUNDLED_MODEL:
+        return "Qwen 2.5 0.5B – mitgeliefert, schnell, einfach"
+    return f"{path.stem} ({path.stat().st_size / 1024 ** 3:.1f} GB)"
+
+
 SYSTEM_PROMPT = (
     "Du bist ein Lernassistent für Teilnehmende einer Umschulung. Du schreibst klare, "
     "gut lesbare Lernnotizen auf Deutsch. Du hältst dich streng an den gegebenen Text "
@@ -643,20 +766,22 @@ def ask_ai(prompt: str, max_tokens: int) -> str:
         "model": "local-model",
         "temperature": 0.2,
         "max_tokens": max_tokens,
+        "chat_template_kwargs": {"enable_thinking": False},  # Qwen3: kein langes "Nachdenken"
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ],
     }
     request = urllib.request.Request(
-        LOCAL_AI_URL,
+        AI.url,
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
     with urllib.request.urlopen(request, timeout=900) as response:
         result = json.loads(response.read().decode("utf-8"))
-    return (result["choices"][0]["message"].get("content") or "").strip()
+    content = result["choices"][0]["message"].get("content") or ""
+    return re.sub(r"<think>.*?(</think>|$)", "", content, flags=re.DOTALL).strip()
 
 
 def ask_ai_safe(build_prompt: Callable[[str], str], text: str, max_tokens: int) -> str:
@@ -685,7 +810,8 @@ def fmt_time(seconds: float) -> str:
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
 
-def split_text(text: str, limit: int = CHUNK_CHARS) -> list[str]:
+def split_text(text: str, limit: int | None = None) -> list[str]:
+    limit = limit or AI.chunk_chars
     sentences = re.split(r"(?<=[.!?])\s+", text)
     chunks, current = [], ""
     for sentence in sentences:
@@ -701,7 +827,8 @@ def split_text(text: str, limit: int = CHUNK_CHARS) -> list[str]:
     return chunks
 
 
-def chunk_segments(segments: list[dict], limit: int = CHUNK_CHARS) -> list[dict]:
+def chunk_segments(segments: list[dict], limit: int | None = None) -> list[dict]:
+    limit = limit or AI.chunk_chars
     chunks: list[dict] = []
     current: list[dict] = []
     length = 0
@@ -737,7 +864,7 @@ def write_notes(parts: list[dict], title: str, progress: Callable[[float, str], 
                 "- Fachbegriffe mit kurzer Erklärung\n"
                 "- Aufgaben, Termine oder Hinweise der Lehrkraft (nur wenn sie genannt werden)"
             ),
-            part["text"], NOTES_MAX_TOKENS,
+            part["text"], AI.notes_tokens,
         ) or "(Keine Notizen erzeugt.)"
     progress(1.0, "Abschnitte fertig.")
 
@@ -749,7 +876,7 @@ def summarize_parts(parts: list[dict], title: str, progress: Callable[[float, st
     if not combined.strip():
         return ""
     rounds = 0
-    while len(combined) > CHUNK_CHARS and rounds < 4:
+    while len(combined) > AI.chunk_chars and rounds < 4:
         rounds += 1
         progress(rounds / 6, f"Notizen werden verdichtet (Runde {rounds}) …")
         combined = "\n\n".join(
@@ -758,7 +885,7 @@ def summarize_parts(parts: list[dict], title: str, progress: Callable[[float, st
                     f"Lernnotizen zu Teilen einer Vorlesung{topic}:\n\n{text}\n\n"
                     "Fasse diese Notizen kürzer zusammen. Behalte Fachbegriffe, Aufgaben und Termine."
                 ),
-                block, NOTES_MAX_TOKENS,
+                block, AI.notes_tokens,
             )
             for block in split_text(combined)
         )
@@ -773,7 +900,7 @@ def summarize_parts(parts: list[dict], title: str, progress: Callable[[float, st
             "## Fachbegriffe\n(Begriff: kurze Erklärung)\n"
             "## Aufgaben und Termine\n(nur wenn genannt, sonst „Keine genannt“)"
         ),
-        combined[: CHUNK_CHARS + 200], SUMMARY_MAX_TOKENS,
+        combined[: AI.chunk_chars + 200], AI.summary_tokens,
     )
     progress(1.0, "Fertig.")
     return summary
@@ -1065,12 +1192,48 @@ st.write(
 
 with st.sidebar:
     st.header("⚙️ Einstellungen")
-    st.write("**Lokales KI-Modell:** Qwen 2.5 0.5B")
+    _busy = get_recorder().running or get_live_processor().busy
+    _models = sorted(MODELS_DIR.glob("*.gguf"), key=lambda p: (p.name != BUNDLED_MODEL, p.name.lower())) \
+        if MODELS_DIR.exists() else []
+    _bundled = MODELS_DIR / BUNDLED_MODEL
+    if not _models:
+        _models = [_bundled]
+    chosen_model = st.selectbox(
+        "KI-Modell für die Zusammenfassung", _models, format_func=model_label, key="ai_model",
+        disabled=_busy, help="Weitere Modelle als .gguf-Datei in den Modell-Ordner legen (siehe unten).",
+    )
+    context = 2048
+    if chosen_model.name != BUNDLED_MODEL:
+        context = st.select_slider(
+            "Kontextgröße (wie viel Text die KI auf einmal sieht)", [4096, 8192, 16384], value=8192,
+            key="ai_context", disabled=_busy,
+            help="Größer = besserer roter Faden, braucht aber mehr Arbeitsspeicher.",
+        )
+        ram = total_ram_gb()
+        size = chosen_model.stat().st_size / 1024 ** 3
+        if ram and size > ram * 0.6:
+            st.warning(f"Das Modell ({size:.1f} GB) ist sehr groß für {ram:.0f} GB Arbeitsspeicher.")
+    _server = get_model_server()
+    if chosen_model.name == BUNDLED_MODEL:
+        _server.stop()
+        AI.configure(BUNDLED_AI_URL, 2048, model_label(chosen_model))
+    elif not _busy or not _server.running_with(chosen_model, context):
+        try:
+            if not _server.running_with(chosen_model, context):
+                with st.spinner(f"{chosen_model.stem} wird geladen … (beim ersten Mal bis zu einigen Minuten)"):
+                    _server.ensure(chosen_model, context)
+            AI.configure(_server.url, context, chosen_model.stem)
+        except Exception as exc:
+            st.error(f"Modell konnte nicht gestartet werden – es wird das mitgelieferte genutzt.\n\n{exc}")
+            AI.configure(BUNDLED_AI_URL, 2048, model_label(_bundled))
+    st.caption(f"Aktiv: **{AI.label}** · Kontext {AI.context} · Abschnitte à ca. "
+               f"{AI.chunk_chars:,} Zeichen".replace(f"{AI.chunk_chars:,}", f"{AI.chunk_chars:,}".replace(",", ".")))
     whisper_model = st.selectbox(
         "Spracherkennung (Whisper)", ["base", "small"], index=0,
         help="„base“ ist mitgeliefert. „small“ erkennt deutlich genauer, ist aber langsamer "
              "und wird beim ersten Mal einmalig aus dem Internet geladen (ca. 460 MB).",
     )
+    st.caption(f"Modell-Ordner: `{MODELS_DIR}`")
     st.caption(f"Aufnahmen: `{RECORDINGS_DIR}`")
     st.caption(f"Notizen: `{NOTES_DIR}`")
 
@@ -1237,5 +1400,6 @@ with st.expander("Datenschutz und Hinweise"):
         "- Aufnahme, Spracherkennung und Zusammenfassung laufen **komplett lokal** auf diesem PC. Es wird nichts ins Internet geschickt.\n"
         "- Nimm Vorlesungen nur mit Erlaubnis auf und gib die Aufnahmen nicht weiter. Das heimliche Aufnehmen nicht öffentlicher Gespräche ist in Deutschland strafbar (§ 201 StGB).\n"
         "- Die Aufnahmen bleiben im Ordner „Aufnahmen“ gespeichert, bis du sie löschst (ca. 115 MB pro Stunde).\n"
-        "- Das mitgelieferte KI-Modell ist sehr klein. Die Notizen sind eine Hilfe, ersetzen aber nicht das Nacharbeiten."
+        "- Das mitgelieferte KI-Modell ist sehr klein. Bessere Modelle (.gguf) kannst du in den Modell-Ordner legen und in der Seitenleiste auswählen.\n"
+        "- Die Notizen sind eine Hilfe, ersetzen aber nicht das Nacharbeiten."
     )
