@@ -149,19 +149,72 @@ class _Resampler:
         return out.astype(np.float32)
 
 
+class _Timeline:
+    """Gemeinsame Zeitachse (16 kHz), auf der Lautsprecher- und Mikrofonton gemischt werden."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.base = 0
+        self.buf = np.zeros(0, dtype=np.float32)
+
+    def add(self, index: int, data: np.ndarray) -> None:
+        with self._lock:
+            if index < self.base:
+                data = data[self.base - index:]
+                index = self.base
+            if not len(data):
+                return
+            start = index - self.base
+            end = start + len(data)
+            if end > len(self.buf):
+                self.buf = np.concatenate([self.buf, np.zeros(end - len(self.buf), dtype=np.float32)])
+            self.buf[start:end] += data
+
+    def take(self, upto: int) -> np.ndarray:
+        """Entnimmt alles bis zum Index `upto`; Lücken werden mit Stille gefüllt."""
+        with self._lock:
+            count = max(0, upto - self.base)
+            if count > len(self.buf):
+                self.buf = np.concatenate([self.buf, np.zeros(count - len(self.buf), dtype=np.float32)])
+            out, self.buf = self.buf[:count], self.buf[count:]
+            self.base += count
+            return out
+
+    @property
+    def end(self) -> int:
+        with self._lock:
+            return self.base + len(self.buf)
+
+
+def _clock_100ns() -> int:
+    """Windows-Leistungszähler in 100-ns-Einheiten – dieselbe Uhr, die WASAPI für Zeitstempel nutzt."""
+    kernel32 = ctypes.windll.kernel32
+    counter, frequency = ctypes.c_int64(), ctypes.c_int64()
+    kernel32.QueryPerformanceCounter(ctypes.byref(counter))
+    kernel32.QueryPerformanceFrequency(ctypes.byref(frequency))
+    return counter.value * 10_000_000 // frequency.value
+
+
+_SOURCE_LABELS = {"speaker": "Lautsprecher/Headset", "mic": "Mikrofon"}
+
+
 class LoopbackRecorder:
-    """Nimmt alles auf, was am Standard-Ausgabegerät (Lautsprecher/Headset) abgespielt wird."""
+    """Nimmt den Ton des Standard-Ausgabegeräts auf – auf Wunsch zusammen mit dem Mikrofon."""
 
     def __init__(self) -> None:
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self.paused = False
+        self.with_mic = False
         self.path: Path | None = None
         self.started_at = 0.0
         self.samples_written = 0
-        self.level = 0.0
-        self.error = ""
-        self.device_format = ""
+        self.got_audio = False
+        self.levels: dict[str, float] = {}
+        self.errors: dict[str, str] = {}
+        self.formats: dict[str, str] = {}
+        self._timeline = _Timeline()
+        self._t0 = 0
 
     # -- Status -------------------------------------------------------------
     @property
@@ -176,50 +229,86 @@ class LoopbackRecorder:
     def wall_seconds(self) -> float:
         return time.time() - self.started_at if self.started_at else 0.0
 
+    @property
+    def error(self) -> str:
+        return " · ".join(f"{_SOURCE_LABELS[k]}: {v}" for k, v in self.errors.items() if v)
+
     # -- Steuerung ----------------------------------------------------------
-    def start(self, path: Path) -> None:
+    def start(self, path: Path, with_mic: bool = False) -> None:
         if self.running:
             return
         path.parent.mkdir(parents=True, exist_ok=True)
         self.path = path
+        self.with_mic = with_mic
         self.samples_written = 0
-        self.level = 0.0
-        self.error = ""
+        self.got_audio = False
+        self.levels, self.errors, self.formats = {}, {}, {}
         self.paused = False
         self.started_at = time.time()
+        self._timeline = _Timeline()
         self._stop.clear()
-        self._thread = threading.Thread(target=self._run, name="loopback-recorder", daemon=True)
+        self._thread = threading.Thread(target=self._run, name="recorder", daemon=True)
         self._thread.start()
 
     def stop(self) -> Path | None:
         self._stop.set()
         if self._thread is not None:
-            self._thread.join(timeout=10)
+            self._thread.join(timeout=15)
         self._thread = None
         self.started_at = 0.0
         return self.path
 
-    # -- Aufnahme-Thread ----------------------------------------------------
+    # -- Schreib-Thread -----------------------------------------------------
     def _run(self) -> None:
-        ole32 = ctypes.windll.ole32
-        ole32.CoInitializeEx(None, 0)
+        sources = [threading.Thread(target=self._source_loop, args=("speaker",), daemon=True)]
+        if self.with_mic:
+            sources.append(threading.Thread(target=self._source_loop, args=("mic",), daemon=True))
         try:
+            self._t0 = _clock_100ns()
             with wave.open(str(self.path), "wb") as wav:
                 wav.setnchannels(1)
                 wav.setsampwidth(2)
                 wav.setframerate(RECORD_RATE)
-                while not self._stop.is_set():
-                    try:
-                        self._capture(ole32, wav)
-                    except Exception as exc:  # z. B. Headset ab-/angesteckt
-                        self.error = f"{exc} – neuer Versuch …"
-                        self._stop.wait(1.0)
+                for thread in sources:
+                    thread.start()
+                while not self._stop.wait(0.5):
+                    # 1,5 s Vorlauf lassen, damit beide Quellen ihre Daten geliefert haben
+                    self._flush(wav, self._now_index() - int(RECORD_RATE * 1.5))
+                for thread in sources:
+                    thread.join(timeout=5)
+                self._flush(wav, self._timeline.end)
         except Exception as exc:
-            self.error = f"Aufnahme konnte nicht gespeichert werden: {exc}"
+            self.errors["speaker"] = f"Aufnahme konnte nicht gespeichert werden: {exc}"
+            self._stop.set()
+
+    def _now_index(self) -> int:
+        return (_clock_100ns() - self._t0) * RECORD_RATE // 10_000_000
+
+    def _flush(self, wav: wave.Wave_write, upto: int) -> None:
+        audio = self._timeline.take(upto)
+        if not len(audio) or self.paused:
+            return  # pausierte Zeit wird verworfen
+        pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype("<i2")
+        wav.writeframes(pcm.tobytes())  # Dateikopf wird dabei laufend aktualisiert
+        self.samples_written += len(pcm)
+
+    # -- Aufnahme-Threads (je Quelle einer) ---------------------------------
+    def _source_loop(self, source: str) -> None:
+        ole32 = ctypes.windll.ole32
+        ole32.CoInitializeEx(None, 0)
+        try:
+            while not self._stop.is_set():
+                try:
+                    self._capture(ole32, source)
+                except Exception as exc:  # z. B. Headset ab-/angesteckt, kein Mikrofon
+                    self.errors[source] = f"{exc} – neuer Versuch …"
+                    self.levels[source] = 0.0
+                    self._stop.wait(1.0 if source == "speaker" else 3.0)
         finally:
             ole32.CoUninitialize()
 
-    def _capture(self, ole32, wav: wave.Wave_write) -> None:
+    def _capture(self, ole32, source: str) -> None:
+        loopback = source == "speaker"
         enumerator, device, client, capture = (ctypes.c_void_p() for _ in range(4))
         mix_format = ctypes.POINTER(_WAVEFORMATEX)()
         try:
@@ -230,9 +319,10 @@ class LoopbackRecorder:
                                        ctypes.byref(iid_enum), ctypes.byref(enumerator)),
                 "Audiogeräte öffnen",
             )
-            # IMMDeviceEnumerator::GetDefaultAudioEndpoint(eRender, eConsole)
+            # IMMDeviceEnumerator::GetDefaultAudioEndpoint(eRender=0 / eCapture=1, eConsole=0)
             _check(_com_method(enumerator, 4, ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p))(
-                enumerator, 0, 0, ctypes.byref(device)), "Standard-Lautsprecher finden")
+                enumerator, 0 if loopback else 1, 0, ctypes.byref(device)),
+                "Standard-Lautsprecher finden" if loopback else "Standard-Mikrofon finden")
             iid_client = _GUID.parse(_IID_IAudioClient)
             # IMMDevice::Activate
             _check(_com_method(device, 3, ctypes.POINTER(_GUID), ctypes.c_uint32, ctypes.c_void_p,
@@ -251,13 +341,14 @@ class LoopbackRecorder:
                 tag = ext.SubFormat.Data1
             if tag not in (_WAVE_FORMAT_PCM, _WAVE_FORMAT_IEEE_FLOAT):
                 raise OSError(f"Nicht unterstütztes Audioformat ({tag})")
-            self.device_format = f"{rate} Hz, {channels} Kanäle, {bits} Bit"
+            self.formats[source] = f"{rate} Hz, {channels} Kanäle"
 
-            # IAudioClient::Initialize (geteilt, Loopback, 1 s Puffer)
+            # IAudioClient::Initialize (geteilter Modus, 1 s Puffer)
+            flags_init = _AUDCLNT_STREAMFLAGS_LOOPBACK if loopback else 0
             _check(_com_method(client, 3, ctypes.c_int, ctypes.c_uint32, ctypes.c_longlong,
                                ctypes.c_longlong, ctypes.POINTER(_WAVEFORMATEX), ctypes.c_void_p)(
-                client, 0, _AUDCLNT_STREAMFLAGS_LOOPBACK, 10_000_000, 0, mix_format, None),
-                "Loopback-Aufnahme vorbereiten")
+                client, 0, flags_init, 10_000_000, 0, mix_format, None),
+                "Aufnahme vorbereiten")
             iid_capture = _GUID.parse(_IID_IAudioCaptureClient)
             _check(_com_method(client, 14, ctypes.POINTER(_GUID), ctypes.POINTER(ctypes.c_void_p))(
                 client, ctypes.byref(iid_capture), ctypes.byref(capture)), "Aufnahmedienst holen")
@@ -266,62 +357,53 @@ class LoopbackRecorder:
             get_next = _com_method(capture, 5, ctypes.POINTER(ctypes.c_uint32))
             get_buffer = _com_method(capture, 3, ctypes.POINTER(ctypes.POINTER(ctypes.c_ubyte)),
                                      ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_uint32),
-                                     ctypes.c_void_p, ctypes.c_void_p)
+                                     ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64))
             release_buffer = _com_method(capture, 4, ctypes.c_uint32)
 
             resample = _Resampler(rate)
-            pending: list[np.ndarray] = []
-            pending_len = 0
-            self.error = ""
+            fallback_index: int | None = None
+            self.errors[source] = ""
 
             while not self._stop.is_set():
-                self._stop.wait(0.05)
+                self._stop.wait(0.02)
                 packet = ctypes.c_uint32()
                 _check(get_next(capture, ctypes.byref(packet)), "Audiodaten abfragen")
                 while packet.value:
                     data = ctypes.POINTER(ctypes.c_ubyte)()
-                    frames = ctypes.c_uint32()
-                    flags = ctypes.c_uint32()
-                    _check(get_buffer(capture, ctypes.byref(data), ctypes.byref(frames),
-                                      ctypes.byref(flags), None, None), "Audiodaten lesen")
+                    frames, flags = ctypes.c_uint32(), ctypes.c_uint32()
+                    position, qpc = ctypes.c_uint64(), ctypes.c_uint64()
+                    _check(get_buffer(capture, ctypes.byref(data), ctypes.byref(frames), ctypes.byref(flags),
+                                      ctypes.byref(position), ctypes.byref(qpc)), "Audiodaten lesen")
                     count = frames.value
-                    if flags.value & _AUDCLNT_BUFFERFLAGS_SILENT or not data:
-                        raw = None
-                    else:
-                        raw = ctypes.string_at(data, count * block_align)
+                    silent = bool(flags.value & _AUDCLNT_BUFFERFLAGS_SILENT) or not data
+                    raw = None if silent else ctypes.string_at(data, count * block_align)
                     release_buffer(capture, count)
 
-                    if raw is None:
-                        samples = np.zeros(count, dtype=np.float32)
+                    samples = np.zeros(count, dtype=np.float32) if raw is None \
+                        else _to_mono_float(raw, tag, bits, channels)
+                    out = resample(samples)
+                    # Position auf der gemeinsamen Zeitachse anhand des Zeitstempels
+                    if qpc.value:
+                        index = (qpc.value - self._t0) * RECORD_RATE // 10_000_000
                     else:
-                        samples = _to_mono_float(raw, tag, bits, channels)
-                    if not self.paused and len(samples):
-                        out = resample(samples)
-                        self.level = float(np.sqrt(np.mean(samples ** 2))) if len(samples) else 0.0
-                        pending.append(out)
-                        pending_len += len(out)
-                    elif self.paused:
-                        self.level = 0.0
+                        index = fallback_index if fallback_index is not None else self._now_index()
+                    fallback_index = index + len(out)
+                    if self.paused:
+                        self.levels[source] = 0.0
+                    elif len(out):
+                        level = float(np.sqrt(np.mean(samples ** 2))) if len(samples) else 0.0
+                        self.levels[source] = level
+                        if level > 1e-4:
+                            self.got_audio = True
+                        self._timeline.add(int(index), out)
                     _check(get_next(capture, ctypes.byref(packet)), "Audiodaten abfragen")
 
-                if pending_len >= RECORD_RATE // 2:
-                    self._write(wav, pending)
-                    pending, pending_len = [], 0
-
-            if pending:
-                self._write(wav, pending)
             _com_method(client, 11)(client)  # IAudioClient::Stop
         finally:
             if mix_format:
                 ole32.CoTaskMemFree(mix_format)
             for obj in (capture, client, device, enumerator):
                 _release(obj)
-
-    def _write(self, wav: wave.Wave_write, blocks: list[np.ndarray]) -> None:
-        audio = np.concatenate(blocks)
-        pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype("<i2")
-        wav.writeframes(pcm.tobytes())  # Dateikopf wird dabei laufend aktualisiert
-        self.samples_written += len(pcm)
 
 
 def _to_mono_float(raw: bytes, tag: int, bits: int, channels: int) -> np.ndarray:
@@ -771,8 +853,9 @@ with lecture_tab:
         st.markdown(
             "**So geht's:** 1. LearnSpace3D öffnen und der Vorlesung beitreten · "
             "2. hier auf **Aufnahme starten** klicken · 3. am Ende **Stoppen & Notizen erstellen**.\n\n"
-            "Aufgenommen wird alles, was über deine Lautsprecher bzw. dein Headset läuft. "
-            "Schalte andere Töne (Musik, Videos) während der Vorlesung aus oder nutze **Pause**."
+            "Aufgenommen wird alles, was über deine Lautsprecher bzw. dein Headset läuft – auf Wunsch "
+            "zusätzlich dein Mikrofon. Schalte andere Töne (Musik, Videos) aus und nutze **Pause** "
+            "für private Gespräche nebenbei."
         )
         consent = st.checkbox(
             "Ich habe die Erlaubnis der Lehrkraft bzw. der WBS, die Vorlesung für meine "
@@ -785,10 +868,14 @@ with lecture_tab:
             if recorder.running:
                 state = "⏸️ Pausiert" if recorder.paused else "🔴 Aufnahme läuft"
                 st.subheader(f"{state} – {fmt_time(recorder.wall_seconds)}")
-                st.progress(min(recorder.level * 4, 1.0),
-                            text="Lautstärke (bewegt sich, wenn Ton ankommt)")
-                st.caption(f"Aufgenommener Ton: {fmt_time(recorder.recorded_seconds)} · "
-                           f"{recorder.device_format} · Datei: {recorder.path}")
+                st.progress(min(recorder.levels.get("speaker", 0.0) * 4, 1.0),
+                            text="🔊 Lautsprecher/Headset (bewegt sich, wenn Ton ankommt)")
+                if recorder.with_mic:
+                    st.progress(min(recorder.levels.get("mic", 0.0) * 4, 1.0),
+                                text="🎙️ Dein Mikrofon")
+                formats = " · ".join(f"{_SOURCE_LABELS[k]} {v}" for k, v in recorder.formats.items())
+                st.caption(f"Aufgenommen: {fmt_time(recorder.recorded_seconds)} · {formats} · "
+                           f"Datei: {recorder.path}")
                 if recorder.error:
                     st.warning(recorder.error)
                 col_pause, col_stop = st.columns(2)
@@ -800,9 +887,15 @@ with lecture_tab:
                     st.session_state["process_recording"] = str(path) if path else None
                     st.rerun()
             else:
+                with_mic = st.checkbox(
+                    "🎙️ Mein Mikrofon auch aufnehmen (damit deine Fragen und Beiträge in den Notizen stehen)",
+                    key="with_mic",
+                    help="Am besten mit Headset. Bei Laptop-Lautsprechern nimmt das Mikrofon die Lehrkraft "
+                         "ein zweites Mal auf, das kann die Erkennung verschlechtern.",
+                )
                 if st.button("🔴 Aufnahme starten", type="primary", width="stretch", disabled=not consent):
                     name = f"{dt.datetime.now():%Y-%m-%d_%H%M}_{safe_filename(st.session_state.get('lecture_title', ''))}.wav"
-                    recorder.start(RECORDINGS_DIR / name)
+                    recorder.start(RECORDINGS_DIR / name, with_mic=with_mic)
                     st.rerun()
                 if not consent:
                     st.caption("Bitte zuerst die Erlaubnis bestätigen.")
@@ -811,10 +904,12 @@ with lecture_tab:
 
         pending = st.session_state.pop("process_recording", None)
         if pending:
-            if recorder.error and recorder.samples_written == 0:
-                st.error(f"Es wurde kein Ton aufgenommen: {recorder.error.replace(' – neuer Versuch …', '')}")
+            if not recorder.got_audio:
+                reason = recorder.error.replace(" – neuer Versuch …", "")
+                st.error("Es kam kein Ton an. Lief die Vorlesung über das Standard-Ausgabegerät von Windows?"
+                         + (f" ({reason})" if reason else ""))
             elif recorder.samples_written < RECORD_RATE * 2:
-                st.warning("Die Aufnahme ist leer oder kürzer als 2 Sekunden. Lief Ton über den Lautsprecher?")
+                st.warning("Die Aufnahme ist kürzer als 2 Sekunden.")
             else:
                 run_pipeline(audio_path=pending, title=st.session_state.get("lecture_title", ""),
                              model_name=whisper_model)
