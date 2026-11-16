@@ -12,6 +12,7 @@ import datetime as dt
 import io
 import json
 import os
+import queue
 import re
 import sys
 import tempfile
@@ -199,22 +200,34 @@ _SOURCE_LABELS = {"speaker": "Lautsprecher/Headset", "mic": "Mikrofon"}
 
 
 class LoopbackRecorder:
-    """Nimmt den Ton des Standard-Ausgabegeräts auf – auf Wunsch zusammen mit dem Mikrofon."""
+    """Nimmt den Ton des Standard-Ausgabegeräts auf – auf Wunsch zusammen mit dem Mikrofon.
+
+    Die Aufnahme wird in Teile aufgeteilt (bei jeder Pause und optional alle X Minuten).
+    Jeder fertige Teil wird an `on_part(pfad, startzeit_in_sekunden, nummer)` übergeben,
+    damit er schon während der laufenden Vorlesung ausgewertet werden kann.
+    """
 
     def __init__(self) -> None:
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self.paused = False
         self.with_mic = False
+        self.base_path: Path | None = None
         self.path: Path | None = None
+        self.part_number = 0
+        self.auto_split_minutes = 0
+        self.on_part: Callable[[Path, float, int], None] | None = None
         self.started_at = 0.0
         self.samples_written = 0
+        self.part_samples = 0
         self.got_audio = False
         self.levels: dict[str, float] = {}
         self.errors: dict[str, str] = {}
         self.formats: dict[str, str] = {}
         self._timeline = _Timeline()
         self._t0 = 0
+        self._skips: list[list] = []      # Zeitbereiche [start, ende) ohne Aufnahme (Pausen)
+        self._split_at: int | None = None  # Index, an dem der aktuelle Teil endet
 
     # -- Status -------------------------------------------------------------
     @property
@@ -226,6 +239,10 @@ class LoopbackRecorder:
         return self.samples_written / RECORD_RATE
 
     @property
+    def part_seconds(self) -> float:
+        return self.part_samples / RECORD_RATE
+
+    @property
     def wall_seconds(self) -> float:
         return time.time() - self.started_at if self.started_at else 0.0
 
@@ -234,23 +251,47 @@ class LoopbackRecorder:
         return " · ".join(f"{_SOURCE_LABELS[k]}: {v}" for k, v in self.errors.items() if v)
 
     # -- Steuerung ----------------------------------------------------------
-    def start(self, path: Path, with_mic: bool = False) -> None:
+    def start(self, path: Path, with_mic: bool = False, auto_split_minutes: int = 0,
+              on_part: Callable[[Path, float, int], None] | None = None) -> None:
         if self.running:
             return
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.path = path
+        self.base_path = path
         self.with_mic = with_mic
+        self.auto_split_minutes = auto_split_minutes
+        self.on_part = on_part
+        self.part_number = 0
         self.samples_written = 0
+        self.part_samples = 0
         self.got_audio = False
         self.levels, self.errors, self.formats = {}, {}, {}
         self.paused = False
+        self._skips = []
+        self._split_at = None
         self.started_at = time.time()
         self._timeline = _Timeline()
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, name="recorder", daemon=True)
         self._thread.start()
 
+    def pause(self) -> None:
+        """Pausiert – der bisherige Teil wird abgeschlossen und kann ausgewertet werden."""
+        if self.paused or not self.running:
+            return
+        now = self._now_index()
+        self._skips.append([now, None])
+        self._split_at = now
+        self.paused = True
+
+    def resume(self) -> None:
+        if not self.paused:
+            return
+        if self._skips and self._skips[-1][1] is None:
+            self._skips[-1][1] = self._now_index()
+        self.paused = False
+
     def stop(self) -> Path | None:
+        self.resume()
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=15)
@@ -259,38 +300,94 @@ class LoopbackRecorder:
         return self.path
 
     # -- Schreib-Thread -----------------------------------------------------
+    def _open_part(self) -> wave.Wave_write:
+        self.part_number += 1
+        self.part_samples = 0
+        self.path = self.base_path.with_name(f"{self.base_path.stem}_Teil{self.part_number:02d}.wav")
+        wav = wave.open(str(self.path), "wb")
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(RECORD_RATE)
+        return wav
+
+    def _close_part(self, wav: wave.Wave_write) -> None:
+        wav.close()
+        start_seconds = (self.samples_written - self.part_samples) / RECORD_RATE
+        if self.part_samples < RECORD_RATE * 2:  # leere/zu kurze Teile verwerfen
+            self.samples_written -= self.part_samples
+            try:
+                self.path.unlink()
+            except OSError:
+                pass
+            self.part_number -= 1
+            return
+        if self.on_part:
+            try:
+                self.on_part(self.path, start_seconds, self.part_number)
+            except Exception as exc:
+                self.errors["speaker"] = f"Teil konnte nicht zur Auswertung übergeben werden: {exc}"
+
     def _run(self) -> None:
         sources = [threading.Thread(target=self._source_loop, args=("speaker",), daemon=True)]
         if self.with_mic:
             sources.append(threading.Thread(target=self._source_loop, args=("mic",), daemon=True))
+        lag = int(RECORD_RATE * 1.5)  # Vorlauf, damit beide Quellen ihre Daten geliefert haben
+        wav = None
         try:
             self._t0 = _clock_100ns()
-            with wave.open(str(self.path), "wb") as wav:
-                wav.setnchannels(1)
-                wav.setsampwidth(2)
-                wav.setframerate(RECORD_RATE)
-                for thread in sources:
-                    thread.start()
-                while not self._stop.wait(0.5):
-                    # 1,5 s Vorlauf lassen, damit beide Quellen ihre Daten geliefert haben
-                    self._flush(wav, self._now_index() - int(RECORD_RATE * 1.5))
-                for thread in sources:
-                    thread.join(timeout=5)
-                self._flush(wav, self._timeline.end)
+            wav = self._open_part()
+            for thread in sources:
+                thread.start()
+            while True:
+                stopping = self._stop.wait(0.5)
+                if stopping:
+                    for thread in sources:
+                        thread.join(timeout=5)
+                    target = max(self._timeline.end, self._now_index())
+                else:
+                    target = self._now_index() - lag
+
+                auto = self.auto_split_minutes * 60 * RECORD_RATE
+                if self._split_at is None and auto and self.part_samples >= auto:
+                    self._split_at = self._timeline.base
+                if self._split_at is not None and target >= self._split_at and not stopping:
+                    self._flush(wav, self._split_at)
+                    self._split_at = None
+                    self._close_part(wav)
+                    wav = self._open_part()
+
+                self._flush(wav, target)
+                if stopping:
+                    break
         except Exception as exc:
             self.errors["speaker"] = f"Aufnahme konnte nicht gespeichert werden: {exc}"
             self._stop.set()
+        finally:
+            if wav is not None:
+                self._close_part(wav)
 
     def _now_index(self) -> int:
         return (_clock_100ns() - self._t0) * RECORD_RATE // 10_000_000
 
     def _flush(self, wav: wave.Wave_write, upto: int) -> None:
+        start = self._timeline.base
         audio = self._timeline.take(upto)
-        if not len(audio) or self.paused:
-            return  # pausierte Zeit wird verworfen
+        if not len(audio):
+            return
+        keep = np.ones(len(audio), dtype=bool)
+        for skip_start, skip_end in self._skips:  # pausierte Zeit verwerfen
+            end = upto if skip_end is None else skip_end
+            lo, hi = max(skip_start, start) - start, min(end, upto) - start
+            if hi > lo:
+                keep[lo:hi] = False
+        self._skips = [s for s in self._skips if s[1] is None or s[1] > upto]
+        audio = audio[keep]
+        if not len(audio):
+            return
         pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype("<i2")
         wav.writeframes(pcm.tobytes())  # Dateikopf wird dabei laufend aktualisiert
         self.samples_written += len(pcm)
+        self.part_samples += len(pcm)
 
     # -- Aufnahme-Threads (je Quelle einer) ---------------------------------
     def _source_loop(self, source: str) -> None:
@@ -388,12 +485,10 @@ class LoopbackRecorder:
                     else:
                         index = fallback_index if fallback_index is not None else self._now_index()
                     fallback_index = index + len(out)
-                    if self.paused:
-                        self.levels[source] = 0.0
-                    elif len(out):
+                    if len(out):  # Pausen verwirft der Schreib-Thread anhand der Zeitachse
                         level = float(np.sqrt(np.mean(samples ** 2))) if len(samples) else 0.0
-                        self.levels[source] = level
-                        if level > 1e-4:
+                        self.levels[source] = 0.0 if self.paused else level
+                        if level > 1e-4 and not self.paused:
                             self.got_audio = True
                         self._timeline.add(int(index), out)
                     _check(get_next(capture, ctypes.byref(packet)), "Audiodaten abfragen")
@@ -442,8 +537,11 @@ _HALLUCINATIONS = re.compile(r"untertitel|amara\.org|copyright|www\.", re.IGNORE
 
 
 def transcribe_file(path: str, model_name: str) -> list[dict]:
+    return transcribe_with(load_whisper_model(model_name), path)
+
+
+def transcribe_with(model, path: str) -> list[dict]:
     """Gibt eine Liste von Abschnitten mit Start-/Endzeit und Text zurück."""
-    model = load_whisper_model(model_name)
     result = model.transcribe(
         path, language="de", fp16=False, verbose=False,
         condition_on_previous_text=False,  # verhindert Endlosschleifen bei Pausen
@@ -624,21 +722,11 @@ def chunk_segments(segments: list[dict], limit: int = CHUNK_CHARS) -> list[dict]
     ]
 
 
-def create_notes(
-    segments: list[dict], document_text: str, title: str,
-    progress: Callable[[float, str], None],
-) -> tuple[str, list[dict]]:
-    """Fasst abschnittsweise zusammen und erstellt anschließend eine Kurzfassung."""
+def write_notes(parts: list[dict], title: str, progress: Callable[[float, str], None]) -> None:
+    """Schreibt Lernnotizen zu jedem Abschnitt (ergänzt part["notes"])."""
     topic = f" zum Thema „{title}“" if title else ""
-    parts = chunk_segments(segments)
-    for doc_chunk in split_text(document_text) if document_text else []:
-        parts.append({"label": "Begleitdokument", "text": doc_chunk})
-    if not parts:
-        return "", []
-
-    total_steps = len(parts) + 1
     for index, part in enumerate(parts, start=1):
-        progress((index - 1) / total_steps, f"Abschnitt {index} von {len(parts)} wird zusammengefasst …")
+        progress((index - 1) / max(len(parts), 1), f"Abschnitt {index} von {len(parts)} wird zusammengefasst …")
         source = "Ausschnitt aus einem Begleitdokument" if part["label"] == "Begleitdokument" \
             else "Ausschnitt aus dem Transkript einer Vorlesung"
         part["notes"] = ask_ai_safe(
@@ -651,13 +739,19 @@ def create_notes(
             ),
             part["text"], NOTES_MAX_TOKENS,
         ) or "(Keine Notizen erzeugt.)"
+    progress(1.0, "Abschnitte fertig.")
 
-    # Notizen so lange verdichten, bis sie in eine einzige Anfrage passen
-    combined = "\n\n".join(p["notes"] for p in parts)
+
+def summarize_parts(parts: list[dict], title: str, progress: Callable[[float, str], None]) -> str:
+    """Verdichtet die Abschnittsnotizen und erstellt die Kurzfassung der ganzen Vorlesung."""
+    topic = f" zum Thema „{title}“" if title else ""
+    combined = "\n\n".join(p.get("notes", "") for p in parts)
+    if not combined.strip():
+        return ""
     rounds = 0
     while len(combined) > CHUNK_CHARS and rounds < 4:
         rounds += 1
-        progress(len(parts) / total_steps, f"Notizen werden verdichtet (Runde {rounds}) …")
+        progress(rounds / 6, f"Notizen werden verdichtet (Runde {rounds}) …")
         combined = "\n\n".join(
             ask_ai_safe(
                 lambda text: (
@@ -669,7 +763,7 @@ def create_notes(
             for block in split_text(combined)
         )
 
-    progress(len(parts) / total_steps, "Kurzfassung der ganzen Vorlesung wird erstellt …")
+    progress(5 / 6, "Kurzfassung der ganzen Vorlesung wird erstellt …")
     summary = ask_ai_safe(
         lambda text: (
             f"Lernnotizen zu einer kompletten Vorlesung{topic}:\n\n{text}\n\n"
@@ -682,6 +776,22 @@ def create_notes(
         combined[: CHUNK_CHARS + 200], SUMMARY_MAX_TOKENS,
     )
     progress(1.0, "Fertig.")
+    return summary
+
+
+def create_notes(
+    segments: list[dict], document_text: str, title: str,
+    progress: Callable[[float, str], None],
+) -> tuple[str, list[dict]]:
+    """Fasst abschnittsweise zusammen und erstellt anschließend eine Kurzfassung."""
+    parts = chunk_segments(segments)
+    for doc_chunk in split_text(document_text) if document_text else []:
+        parts.append({"label": "Begleitdokument", "text": doc_chunk})
+    if not parts:
+        return "", []
+    share = len(parts) / (len(parts) + 2)
+    write_notes(parts, title, lambda v, t: progress(v * share, t))
+    summary = summarize_parts(parts, title, lambda v, t: progress(share + v * (1 - share), t))
     return summary, parts
 
 
@@ -821,6 +931,130 @@ def run_pipeline(*, audio_path: str | None = None, audio_bytes: bytes | None = N
 
 
 # ---------------------------------------------------------------------------
+# Auswertung im Hintergrund – Teil für Teil, während die Vorlesung weiterläuft
+# ---------------------------------------------------------------------------
+class LiveProcessor:
+    def __init__(self) -> None:
+        self._queue: queue.Queue = queue.Queue()
+        self._thread: threading.Thread | None = None
+        self._models: dict = {}
+        self.recorder: LoopbackRecorder | None = None
+        self.reset("", "base")
+
+    def reset(self, title: str, model_name: str) -> None:
+        self.session_id = uuid.uuid4().hex  # alte, noch wartende Aufträge werden ignoriert
+        self.title = title
+        self.model_name = model_name
+        self.parts: list[dict] = []
+        self.closed = False
+        self.final_status = ""
+        self.error = ""
+        self.result: dict | None = None
+
+    @property
+    def active(self) -> bool:
+        return bool(self.parts) or self.closed
+
+    @property
+    def busy(self) -> bool:
+        if any(p["state"] in ("wartet", "läuft") for p in self.parts):
+            return True
+        return self.closed and self.result is None and not self.error
+
+    def submit(self, path: Path, offset: float, number: int) -> None:
+        part = {"number": number, "path": path, "offset": offset, "state": "wartet",
+                "status": "Wartet auf Auswertung …", "segments": [], "chunks": []}
+        self.parts.append(part)
+        self._queue.put(("part", self.session_id, part))
+        self._ensure_thread()
+
+    def finish(self) -> None:
+        self.closed = True
+        self._queue.put(("final", self.session_id, None))
+        self._ensure_thread()
+
+    def _ensure_thread(self) -> None:
+        if self._thread is None or not self._thread.is_alive():
+            self._thread = threading.Thread(target=self._work, name="live-processor", daemon=True)
+            self._thread.start()
+
+    def _model(self):
+        if self.model_name not in self._models:
+            self._models[self.model_name] = whisper.load_model(
+                self.model_name, download_root=str(WHISPER_MODEL_DIR))
+        return self._models[self.model_name]
+
+    def _limit_threads(self) -> None:
+        """Während der Vorlesung nur die Hälfte der Prozessorkerne nutzen, damit LearnSpace3D flüssig bleibt."""
+        try:
+            import torch
+            cores = os.cpu_count() or 2
+            recording = self.recorder is not None and self.recorder.running
+            torch.set_num_threads(max(1, cores // 2) if recording else cores)
+        except Exception:
+            pass
+
+    def _work(self) -> None:
+        while True:
+            kind, session_id, part = self._queue.get()
+            if session_id != self.session_id:
+                continue
+            try:
+                if kind == "part":
+                    self._do_part(part)
+                else:
+                    self._do_final()
+            except Exception as exc:
+                if part is not None:
+                    part["state"], part["status"] = "fehler", f"Fehler: {exc}"
+                else:
+                    self.error = f"Die Endfassung konnte nicht erstellt werden: {exc}"
+
+    def _do_part(self, part: dict) -> None:
+        part["state"], part["status"] = "läuft", "🎧 Sprache wird in Text umgewandelt …"
+        self._limit_threads()
+        segments = transcribe_with(self._model(), str(part["path"]))
+        for seg in segments:
+            seg["start"] += part["offset"]
+            seg["end"] += part["offset"]
+        part["segments"] = segments
+        chunks = chunk_segments(segments)
+        write_notes(chunks, self.title, lambda v, t: part.__setitem__("status", f"🧠 {t}"))
+        part["chunks"] = chunks
+        part["state"] = "fertig"
+        part["status"] = "✅ Fertig" if segments else "✅ Fertig (keine Sprache erkannt)"
+
+    def _do_final(self) -> None:
+        segments = [s for p in self.parts for s in p["segments"]]
+        chunks = [c for p in self.parts for c in p["chunks"]]
+        if not chunks:
+            self.error = "In der Aufnahme wurde keine Sprache erkannt."
+            return
+        summary = summarize_parts(chunks, self.title, lambda v, t: setattr(self, "final_status", t))
+        created = dt.datetime.now()
+        docx_bytes = build_docx(self.title, summary, chunks, segments, created)
+        filename = f"{created:%Y-%m-%d_%H%M}_{safe_filename(self.title)}.docx"
+        saved_to = ""
+        try:
+            NOTES_DIR.mkdir(parents=True, exist_ok=True)
+            (NOTES_DIR / filename).write_bytes(docx_bytes)
+            saved_to = str(NOTES_DIR / filename)
+        except OSError:
+            pass
+        self.final_status = "Fertig."
+        self.result = {
+            "id": self.session_id, "title": self.title, "summary": summary, "parts": chunks,
+            "transcript": "\n".join(f"[{fmt_time(s['start'])}] {s['text']}" for s in segments),
+            "docx": docx_bytes, "filename": filename, "saved_to": saved_to,
+        }
+
+
+@st.cache_resource
+def get_live_processor() -> LiveProcessor:
+    return LiveProcessor()
+
+
+# ---------------------------------------------------------------------------
 # Oberfläche
 # ---------------------------------------------------------------------------
 st.title("🎓 Gesprächsnotiz-AI")
@@ -843,27 +1077,31 @@ with st.sidebar:
 lecture_tab, file_tab = st.tabs(["🎓 Vorlesung aufnehmen", "📁 Datei auswerten"])
 
 recorder = get_recorder()
+live = get_live_processor()
+live.recorder = recorder
 
 with lecture_tab:
     if not sys.platform.startswith("win"):
         st.error("Die Systemton-Aufnahme funktioniert nur unter Windows.")
     else:
         title = st.text_input("Thema / Fach der Vorlesung", key="lecture_title",
-                              placeholder="z. B. Netzwerktechnik – Subnetting")
+                              placeholder="z. B. Netzwerktechnik – Subnetting",
+                              disabled=recorder.running)
         st.markdown(
             "**So geht's:** 1. LearnSpace3D öffnen und der Vorlesung beitreten · "
             "2. hier auf **Aufnahme starten** klicken · 3. am Ende **Stoppen & Notizen erstellen**.\n\n"
+            "Jedes Mal, wenn du **Pause** drückst, wird der bisherige Teil schon **im Hintergrund "
+            "ausgewertet**, während du danach mit **Weiter** den nächsten Teil aufnimmst. "
             "Aufgenommen wird alles, was über deine Lautsprecher bzw. dein Headset läuft – auf Wunsch "
-            "zusätzlich dein Mikrofon. Schalte andere Töne (Musik, Videos) aus und nutze **Pause** "
-            "für private Gespräche nebenbei."
+            "zusätzlich dein Mikrofon. Andere Töne (Musik, Videos) bitte ausschalten."
         )
         consent = st.checkbox(
             "Ich habe die Erlaubnis der Lehrkraft bzw. der WBS, die Vorlesung für meine "
             "persönlichen Lernnotizen aufzunehmen, und gebe die Aufnahme nicht weiter.",
-            key="consent",
+            key="consent", disabled=recorder.running,
         )
 
-        @st.fragment(run_every=1.0 if recorder.running else None)
+        @st.fragment(run_every=1.0 if (recorder.running or live.busy) else None)
         def recorder_panel() -> None:
             if recorder.running:
                 state = "⏸️ Pausiert" if recorder.paused else "🔴 Aufnahme läuft"
@@ -871,48 +1109,78 @@ with lecture_tab:
                 st.progress(min(recorder.levels.get("speaker", 0.0) * 4, 1.0),
                             text="🔊 Lautsprecher/Headset (bewegt sich, wenn Ton ankommt)")
                 if recorder.with_mic:
-                    st.progress(min(recorder.levels.get("mic", 0.0) * 4, 1.0),
-                                text="🎙️ Dein Mikrofon")
-                formats = " · ".join(f"{_SOURCE_LABELS[k]} {v}" for k, v in recorder.formats.items())
-                st.caption(f"Aufgenommen: {fmt_time(recorder.recorded_seconds)} · {formats} · "
-                           f"Datei: {recorder.path}")
+                    st.progress(min(recorder.levels.get("mic", 0.0) * 4, 1.0), text="🎙️ Dein Mikrofon")
+                auto = f" · neuer Teil automatisch alle {recorder.auto_split_minutes} Min" \
+                    if recorder.auto_split_minutes else ""
+                st.caption(f"Teil {recorder.part_number}: {fmt_time(recorder.part_seconds)} · "
+                           f"gesamt {fmt_time(recorder.recorded_seconds)}{auto}")
                 if recorder.error:
                     st.warning(recorder.error)
                 col_pause, col_stop = st.columns(2)
-                if col_pause.button("▶️ Weiter" if recorder.paused else "⏸️ Pause", width="stretch"):
-                    recorder.paused = not recorder.paused
+                if recorder.paused:
+                    if col_pause.button("▶️ Weiter (nächster Teil)", width="stretch"):
+                        recorder.resume()
+                        st.rerun()
+                elif col_pause.button("⏸️ Pause & bisherigen Teil auswerten", width="stretch"):
+                    recorder.pause()
                     st.rerun()
                 if col_stop.button("⏹️ Stoppen & Notizen erstellen", type="primary", width="stretch"):
-                    path = recorder.stop()
-                    st.session_state["process_recording"] = str(path) if path else None
+                    recorder.stop()
+                    if not recorder.got_audio:
+                        st.session_state["no_audio"] = recorder.error.replace(" – neuer Versuch …", "")
+                    live.finish()
                     st.rerun()
-            else:
+            elif not live.busy:
                 with_mic = st.checkbox(
                     "🎙️ Mein Mikrofon auch aufnehmen (damit deine Fragen und Beiträge in den Notizen stehen)",
                     key="with_mic",
                     help="Am besten mit Headset. Bei Laptop-Lautsprechern nimmt das Mikrofon die Lehrkraft "
                          "ein zweites Mal auf, das kann die Erkennung verschlechtern.",
                 )
+                auto_minutes = st.number_input(
+                    "Automatisch alle … Minuten einen neuen Teil beginnen und auswerten (0 = nur bei Pause)",
+                    min_value=0, max_value=120, value=30, step=5, key="auto_split",
+                )
                 if st.button("🔴 Aufnahme starten", type="primary", width="stretch", disabled=not consent):
-                    name = f"{dt.datetime.now():%Y-%m-%d_%H%M}_{safe_filename(st.session_state.get('lecture_title', ''))}.wav"
-                    recorder.start(RECORDINGS_DIR / name, with_mic=with_mic)
+                    title_now = st.session_state.get("lecture_title", "")
+                    name = f"{dt.datetime.now():%Y-%m-%d_%H%M}_{safe_filename(title_now)}.wav"
+                    live.reset(title_now, whisper_model)
+                    st.session_state.pop("no_audio", None)
+                    recorder.start(RECORDINGS_DIR / name, with_mic=with_mic,
+                                   auto_split_minutes=int(auto_minutes), on_part=live.submit)
                     st.rerun()
                 if not consent:
                     st.caption("Bitte zuerst die Erlaubnis bestätigen.")
 
+            if recorder.running and not live.parts:
+                st.caption("Der erste Teil wird ausgewertet, sobald du Pause drückst"
+                           + (f" oder nach {recorder.auto_split_minutes} Minuten." if recorder.auto_split_minutes else "."))
+
+            # Fortschritt der einzelnen Teile
+            if live.active:
+                st.markdown("**Auswertung der Teile**")
+                for part in live.parts:
+                    start = fmt_time(part["offset"])
+                    st.write(f"Teil {part['number']} (ab {start}): {part['status']}")
+                    if part["state"] == "fertig" and part["chunks"]:
+                        with st.expander(f"Notizen zu Teil {part['number']} ansehen"):
+                            for chunk in part["chunks"]:
+                                st.markdown(f"**{chunk['label']}**\n\n{chunk.get('notes', '')}")
+                if live.closed and live.busy:
+                    st.info("⏳ " + (live.final_status or "Die restlichen Teile werden noch ausgewertet …"))
+                if live.error and st.session_state.get("no_audio") is None:
+                    st.error(live.error)
+                if live.result and st.session_state.get("shown_result") != live.result["id"]:
+                    st.session_state["shown_result"] = live.result["id"]
+                    st.session_state["result"] = live.result
+                    st.rerun()
+
         recorder_panel()
 
-        pending = st.session_state.pop("process_recording", None)
-        if pending:
-            if not recorder.got_audio:
-                reason = recorder.error.replace(" – neuer Versuch …", "")
-                st.error("Es kam kein Ton an. Lief die Vorlesung über das Standard-Ausgabegerät von Windows?"
-                         + (f" ({reason})" if reason else ""))
-            elif recorder.samples_written < RECORD_RATE * 2:
-                st.warning("Die Aufnahme ist kürzer als 2 Sekunden.")
-            else:
-                run_pipeline(audio_path=pending, title=st.session_state.get("lecture_title", ""),
-                             model_name=whisper_model)
+        if st.session_state.get("no_audio") is not None and live.closed and not live.busy:
+            reason = st.session_state["no_audio"]
+            st.error("Es kam kein Ton an. Lief die Vorlesung über das Standard-Ausgabegerät von Windows?"
+                     + (f" ({reason})" if reason else ""))
 
         with st.expander("Ältere Aufnahme auswerten (z. B. nach einem Absturz)"):
             recordings = sorted(RECORDINGS_DIR.glob("*.wav"), reverse=True) if RECORDINGS_DIR.exists() else []
@@ -920,7 +1188,7 @@ with lecture_tab:
                 st.caption("Noch keine gespeicherten Aufnahmen.")
             else:
                 chosen = st.selectbox("Aufnahme", recordings, format_func=lambda p: p.name)
-                if st.button("Diese Aufnahme auswerten", disabled=recorder.running):
+                if st.button("Diese Aufnahme auswerten", disabled=recorder.running or live.busy):
                     run_pipeline(audio_path=str(chosen), title=st.session_state.get("lecture_title", ""),
                                  model_name=whisper_model)
 
