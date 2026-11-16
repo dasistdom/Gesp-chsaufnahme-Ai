@@ -43,6 +43,7 @@ WHISPER_MODEL_DIR = Path(__file__).resolve().parent / "runtime" / "whisper"
 LLAMA_DIR = Path(__file__).resolve().parent / "runtime" / "llama"
 MODELS_DIR = LLAMA_DIR / "Modelle"
 BUNDLED_MODEL = "qwen2.5-0.5b-instruct-q4_k_m.gguf"
+PREFERRED_MODEL = "qwen3-8b"  # wird automatisch gewählt, wenn eine passende .gguf-Datei vorhanden ist
 BUNDLED_AI_URL = "http://127.0.0.1:9931/v1/chat/completions"  # startet GespraechsnotizAI.exe
 SUPPORTED_AUDIO = ("wav", "mp3", "m4a", "mpeg", "mpga", "webm", "ogg")
 MAX_DOCUMENT_CHARS = 120_000
@@ -750,21 +751,55 @@ def get_model_server() -> ModelServer:
 
 def model_label(path: Path) -> str:
     if path.name == BUNDLED_MODEL:
-        return "Qwen 2.5 0.5B – mitgeliefert, schnell, einfach"
+        return "Qwen 2.5 0.5B – mitgeliefert, schnell, aber schwache Notizen"
+    if PREFERRED_MODEL in path.name.lower():
+        return f"Qwen 3 8B – empfohlen ({path.stat().st_size / 1024 ** 3:.1f} GB)"
     return f"{path.stem} ({path.stat().st_size / 1024 ** 3:.1f} GB)"
 
 
 SYSTEM_PROMPT = (
     "Du bist ein Lernassistent für Teilnehmende einer Umschulung. Du schreibst klare, "
-    "gut lesbare Lernnotizen auf Deutsch. Du hältst dich streng an den gegebenen Text "
-    "und erfindest nichts dazu. Unverständliche Stellen lässt du weg."
+    "gut lesbare Lernnotizen auf Deutsch, neutral in der dritten Person (z. B. „Die Lehrkraft "
+    "erklärt …“, „Es wird besprochen …“) – niemals in der Ich-Form. Du hältst dich streng an "
+    "den gegebenen Text, erfindest nichts und wiederholst dich nie. Die Transkripte wurden "
+    "automatisch erstellt und enthalten Hörfehler: Deute falsch erkannte Wörter sinnvoll aus dem "
+    "Zusammenhang oder lass sie weg. Unverständliche Stellen lässt du weg."
 )
+
+NOTES_INSTRUCTIONS = """Schreibe Lernnotizen zu diesem Ausschnitt. Halte dich genau an dieses Format:
+
+- 3 bis 8 Stichpunkte mit den wichtigsten Aussagen, jeder als vollständiger Satz.
+
+Fachbegriffe:
+- Begriff – kurze Erklärung (nur echte Fachbegriffe, die im Text vorkommen)
+
+Aufgaben/Termine:
+- nur wenn im Text eine Aufgabe, Frist oder ein Termin genannt wird
+
+Lass „Fachbegriffe“ oder „Aufgaben/Termine“ komplett weg, wenn es dazu nichts gibt.
+Schreibe die Anweisungen selbst nicht ab und wiederhole keinen Punkt."""
+
+SUMMARY_INSTRUCTIONS = """Erstelle daraus eine Zusammenfassung mit genau diesen Überschriften:
+
+## Worum ging es?
+2 bis 4 Sätze Fließtext.
+
+## Die wichtigsten Punkte
+5 bis 10 Stichpunkte, jeder als vollständiger Satz.
+
+## Fachbegriffe
+Höchstens 10 echte Fachbegriffe, jeweils „Begriff – Erklärung“. Keine Wiederholungen.
+
+## Aufgaben und Termine
+Nur was ausdrücklich genannt wurde, sonst „Keine genannt“."""
 
 
 def ask_ai(prompt: str, max_tokens: int) -> str:
     payload = {
         "model": "local-model",
-        "temperature": 0.2,
+        "temperature": 0.3,
+        "repeat_penalty": 1.15,      # gegen Endlos-Wiederholungen
+        "repeat_last_n": 256,
         "max_tokens": max_tokens,
         "chat_template_kwargs": {"enable_thinking": False},  # Qwen3: kein langes "Nachdenken"
         "messages": [
@@ -781,7 +816,41 @@ def ask_ai(prompt: str, max_tokens: int) -> str:
     with urllib.request.urlopen(request, timeout=900) as response:
         result = json.loads(response.read().decode("utf-8"))
     content = result["choices"][0]["message"].get("content") or ""
-    return re.sub(r"<think>.*?(</think>|$)", "", content, flags=re.DOTALL).strip()
+    content = re.sub(r"<think>.*?(</think>|$)", "", content, flags=re.DOTALL)
+    return clean_output(content)
+
+
+_ECHO_LINES = re.compile(
+    r"^(lernnotizen:?|die wichtigsten inhalte:?|fachbegriffe mit kurzer erklärung:?|"
+    r"aufgaben, termine oder hinweise.*|.*keine (genannten )?(termine|hinweise|aufgaben)( genannt)?\.?)$",
+    re.IGNORECASE,
+)
+
+
+def clean_output(text: str) -> str:
+    """Entfernt Wiederholungen, abgeschriebene Anweisungen und leere Platzhalter."""
+    seen: set[str] = set()
+    lines: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        key = re.sub(r"[^\w]+", " ", stripped.lower()).strip()
+        bare = re.sub(r"^[-*•\d.)\s]+", "", stripped).strip("*: ").strip()
+        if key and key in seen:
+            continue  # wörtliche Wiederholung
+        if bare and _ECHO_LINES.match(bare) and bare.lower().rstrip(".") != "keine genannt":
+            continue
+        if key:
+            seen.add(key)
+        lines.append(line.rstrip())
+    # leere Zwischenüberschriften (z. B. „Fachbegriffe:“ ohne Punkte darunter) entfernen
+    result: list[str] = []
+    for index, line in enumerate(lines):
+        if line.strip().endswith(":") and not line.lstrip().startswith(("-", "*", "•")):
+            following = next((l for l in lines[index + 1:] if l.strip()), "")
+            if not following.lstrip().startswith(("-", "*", "•")):
+                continue
+        result.append(line)
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(result)).strip()
 
 
 def ask_ai_safe(build_prompt: Callable[[str], str], text: str, max_tokens: int) -> str:
@@ -855,14 +924,10 @@ def write_notes(parts: list[dict], title: str, progress: Callable[[float, str], 
     for index, part in enumerate(parts, start=1):
         progress((index - 1) / max(len(parts), 1), f"Abschnitt {index} von {len(parts)} wird zusammengefasst …")
         source = "Ausschnitt aus einem Begleitdokument" if part["label"] == "Begleitdokument" \
-            else "Ausschnitt aus dem Transkript einer Vorlesung"
+            else "Ausschnitt aus dem automatischen Transkript einer Vorlesung bzw. eines Gesprächs"
         part["notes"] = ask_ai_safe(
             lambda text, source=source: (
-                f"{source}{topic}:\n\n{text}\n\n"
-                "Schreibe dazu kurze Lernnotizen als Stichpunkte:\n"
-                "- die wichtigsten Inhalte\n"
-                "- Fachbegriffe mit kurzer Erklärung\n"
-                "- Aufgaben, Termine oder Hinweise der Lehrkraft (nur wenn sie genannt werden)"
+                f"{source}{topic}:\n\n<<<\n{text}\n>>>\n\n{NOTES_INSTRUCTIONS}"
             ),
             part["text"], AI.notes_tokens,
         ) or "(Keine Notizen erzeugt.)"
@@ -882,8 +947,9 @@ def summarize_parts(parts: list[dict], title: str, progress: Callable[[float, st
         combined = "\n\n".join(
             ask_ai_safe(
                 lambda text: (
-                    f"Lernnotizen zu Teilen einer Vorlesung{topic}:\n\n{text}\n\n"
-                    "Fasse diese Notizen kürzer zusammen. Behalte Fachbegriffe, Aufgaben und Termine."
+                    f"Lernnotizen zu Teilen einer Vorlesung{topic}:\n\n<<<\n{text}\n>>>\n\n"
+                    "Fasse diese Notizen in 5 bis 10 Stichpunkten kürzer zusammen. Behalte wichtige "
+                    "Fachbegriffe, Aufgaben und Termine. Wiederhole nichts."
                 ),
                 block, AI.notes_tokens,
             )
@@ -893,12 +959,8 @@ def summarize_parts(parts: list[dict], title: str, progress: Callable[[float, st
     progress(5 / 6, "Kurzfassung der ganzen Vorlesung wird erstellt …")
     summary = ask_ai_safe(
         lambda text: (
-            f"Lernnotizen zu einer kompletten Vorlesung{topic}:\n\n{text}\n\n"
-            "Erstelle daraus eine Zusammenfassung mit diesen Überschriften:\n"
-            "## Worum ging es?\n(2–3 Sätze)\n"
-            "## Die wichtigsten Punkte\n(Stichpunkte)\n"
-            "## Fachbegriffe\n(Begriff: kurze Erklärung)\n"
-            "## Aufgaben und Termine\n(nur wenn genannt, sonst „Keine genannt“)"
+            f"Lernnotizen zu einer kompletten Vorlesung{topic}:\n\n<<<\n{text}\n>>>\n\n"
+            f"{SUMMARY_INSTRUCTIONS}"
         ),
         combined[: AI.chunk_chars + 200], AI.summary_tokens,
     )
@@ -1198,8 +1260,12 @@ with st.sidebar:
     _bundled = MODELS_DIR / BUNDLED_MODEL
     if not _models:
         _models = [_bundled]
+    # Standard: Qwen 3 8B, falls vorhanden – sonst das größte zusätzliche Modell, sonst das mitgelieferte
+    _preferred = next((m for m in _models if PREFERRED_MODEL in m.name.lower()), None) \
+        or max((m for m in _models if m.name != BUNDLED_MODEL), key=lambda m: m.stat().st_size, default=None)
     chosen_model = st.selectbox(
         "KI-Modell für die Zusammenfassung", _models, format_func=model_label, key="ai_model",
+        index=_models.index(_preferred) if _preferred in _models else 0,
         disabled=_busy, help="Weitere Modelle als .gguf-Datei in den Modell-Ordner legen (siehe unten).",
     )
     context = 2048
@@ -1229,9 +1295,13 @@ with st.sidebar:
     st.caption(f"Aktiv: **{AI.label}** · Kontext {AI.context} · Abschnitte à ca. "
                f"{AI.chunk_chars:,} Zeichen".replace(f"{AI.chunk_chars:,}", f"{AI.chunk_chars:,}".replace(",", ".")))
     whisper_model = st.selectbox(
-        "Spracherkennung (Whisper)", ["base", "small"], index=0,
-        help="„base“ ist mitgeliefert. „small“ erkennt deutlich genauer, ist aber langsamer "
-             "und wird beim ersten Mal einmalig aus dem Internet geladen (ca. 460 MB).",
+        "Spracherkennung (Whisper)", ["base", "small", "turbo"], index=0,
+        format_func={"base": "base – mitgeliefert, schnell, macht mehr Hörfehler",
+                     "small": "small – deutlich genauer (einmalig ca. 460 MB Download)",
+                     "turbo": "turbo – sehr genau, langsam ohne Grafikkarte (einmalig ca. 1,6 GB)"}.get,
+        help="Je genauer die Spracherkennung, desto besser werden auch die Notizen. "
+             "„small“ und „turbo“ werden beim ersten Mal einmalig aus dem Internet geladen.",
+        disabled=get_recorder().running or get_live_processor().busy,
     )
     st.caption(f"Modell-Ordner: `{MODELS_DIR}`")
     st.caption(f"Aufnahmen: `{RECORDINGS_DIR}`")
