@@ -30,6 +30,7 @@ from typing import Callable, Iterable
 
 import numpy as np
 import streamlit as st
+import streamlit.components.v1 as components
 import whisper
 from docx import Document
 from docx.shared import Pt
@@ -1244,6 +1245,176 @@ def get_live_processor() -> LiveProcessor:
 
 
 # ---------------------------------------------------------------------------
+# Pausen-Spiel „Kachelfusion“ (läuft komplett im Browser)
+# ---------------------------------------------------------------------------
+GAME_HTML = r"""
+<!doctype html><html><head><meta charset="utf-8">
+<style>
+  :root { --bg:#0f1117; --panel:#1a1d29; --cell:#232736; --text:#e8eaf2; --muted:#8b90a5; --accent:#ff4b6e; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:"Source Sans Pro",system-ui,sans-serif; background:transparent; color:var(--text);
+         display:flex; justify-content:center; user-select:none; }
+  .wrap { width:min(440px,100%); padding:8px; outline:none; }
+  .top { display:flex; align-items:center; gap:8px; margin-bottom:12px; }
+  .title { font-size:26px; font-weight:800; letter-spacing:.5px; flex:1;
+           background:linear-gradient(90deg,#4fd1c5,#9f7aea,#ff4b6e); -webkit-background-clip:text; color:transparent; }
+  .score { background:var(--panel); border-radius:10px; padding:6px 12px; text-align:center; min-width:72px; }
+  .score small { display:block; font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:1px; }
+  .score b { font-size:18px; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:10px; padding:10px 14px; font-weight:700;
+           cursor:pointer; font-size:14px; }
+  button:hover { filter:brightness(1.1); }
+  .board { position:relative; background:var(--panel); border-radius:16px; padding:10px; aspect-ratio:1;
+           display:grid; grid-template-columns:repeat(4,1fr); gap:10px; touch-action:none; }
+  .cell { background:var(--cell); border-radius:12px; }
+  .tile { position:absolute; display:flex; align-items:center; justify-content:center; border-radius:12px;
+          font-weight:800; transition:transform 110ms ease-out; will-change:transform; }
+  .tile.new { animation:pop 160ms ease-out; }
+  .tile.merged .in { animation:bump 180ms ease-out; }
+  .in { width:100%; height:100%; display:flex; align-items:center; justify-content:center; border-radius:12px; }
+  @keyframes pop { from { opacity:0; scale:.4 } to { opacity:1; scale:1 } }
+  @keyframes bump { 50% { scale:1.15 } }
+  .hint { color:var(--muted); font-size:13px; text-align:center; margin-top:10px; }
+  .overlay { position:absolute; inset:0; border-radius:16px; background:rgba(15,17,23,.82); display:none;
+             flex-direction:column; align-items:center; justify-content:center; gap:12px; z-index:5; }
+  .overlay.show { display:flex; }
+  .overlay h2 { margin:0; font-size:28px; }
+</style></head>
+<body>
+<div class="wrap" id="wrap" tabindex="0">
+  <div class="top">
+    <div class="title">Kachelfusion</div>
+    <div class="score"><small>Punkte</small><b id="score">0</b></div>
+    <div class="score"><small>Rekord</small><b id="best">0</b></div>
+    <button id="new">Neu</button>
+  </div>
+  <div class="board" id="board">
+    <div class="overlay" id="overlay"><h2 id="msg"></h2><button id="again">Nochmal</button></div>
+  </div>
+  <div class="hint">Pfeiltasten oder W A S D · auf dem Handy wischen · gleiche Kacheln verschmelzen</div>
+</div>
+<script>
+(() => {
+  const N = 4;
+  const COLORS = {2:["#2b3a55","#cfe3ff"],4:["#2c4f6b","#d9f0ff"],8:["#167a8a","#fff"],16:["#13a39a","#fff"],
+    32:["#3cb371","#fff"],64:["#7bc043","#102010"],128:["#c9b52a","#1b1700"],256:["#e8912d","#fff"],
+    512:["#e5603d","#fff"],1024:["#d6336c","#fff"],2048:["#9f43d9","#fff"],4096:["#6741d9","#fff"]};
+  const store = { get(k){ try { return localStorage.getItem(k); } catch(e) { return null; } },
+                  set(k,v){ try { localStorage.setItem(k,v); } catch(e) {} } };
+  const board = document.getElementById("board"), wrap = document.getElementById("wrap");
+  const scoreEl = document.getElementById("score"), bestEl = document.getElementById("best");
+  const overlay = document.getElementById("overlay"), msg = document.getElementById("msg");
+  for (let i = 0; i < N*N; i++) { const c = document.createElement("div"); c.className = "cell"; board.appendChild(c); }
+  let grid, score, best = +(store.get("kachelfusion-best") || 0), won, nextId = 1, tiles = new Map();
+  bestEl.textContent = best;
+
+  function empty() { return Array.from({length:N}, () => Array(N).fill(null)); }
+  function addRandom() {
+    const free = [];
+    for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) if (!grid[r][c]) free.push([r,c]);
+    if (!free.length) return;
+    const [r,c] = free[Math.floor(Math.random()*free.length)];
+    grid[r][c] = { id: nextId++, v: Math.random() < 0.9 ? 2 : 4, isNew: true };
+  }
+  function start(saved) {
+    board.querySelectorAll(".tile").forEach(t => t.remove()); tiles.clear();
+    overlay.classList.remove("show"); won = false;
+    if (saved) { grid = saved.grid.map(row => row.map(v => v ? { id: nextId++, v } : null)); score = saved.score; won = saved.won; }
+    else { grid = empty(); score = 0; addRandom(); addRandom(); }
+    render(); wrap.focus();
+  }
+  function save() {
+    store.set("kachelfusion-state", JSON.stringify({ grid: grid.map(r => r.map(t => t ? t.v : 0)), score, won }));
+  }
+  function geometry() {
+    const pad = 10, gap = 10, size = (board.clientWidth - 2*pad - (N-1)*gap) / N;
+    return { pad, gap, size };
+  }
+  function render() {
+    const { pad, gap, size } = geometry(), seen = new Set();
+    for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) {
+      const t = grid[r][c]; if (!t) continue; seen.add(t.id);
+      let el = tiles.get(t.id);
+      if (!el) { el = document.createElement("div"); el.className = "tile"; el.innerHTML = '<div class="in"></div>';
+                 board.appendChild(el); tiles.set(t.id, el); if (t.isNew) el.classList.add("new"); }
+      const [bg, fg] = COLORS[t.v] || ["#212529","#fff"], inner = el.firstChild;
+      inner.style.background = bg; inner.style.color = fg; inner.textContent = t.v;
+      inner.style.fontSize = (t.v >= 1024 ? size*0.3 : t.v >= 128 ? size*0.36 : size*0.42) + "px";
+      el.style.width = el.style.height = size + "px";
+      el.style.transform = `translate(${pad + c*(size+gap)}px, ${pad + r*(size+gap)}px)`;
+      el.classList.toggle("merged", !!t.merged);
+      t.isNew = false; t.merged = false;
+    }
+    for (const [id, el] of tiles) if (!seen.has(id)) { el.remove(); tiles.delete(id); }
+    scoreEl.textContent = score;
+    if (score > best) { best = score; bestEl.textContent = best; store.set("kachelfusion-best", best); }
+  }
+  function move(dir) {   // 0 links, 1 rechts, 2 hoch, 3 runter
+    if (overlay.classList.contains("show")) return;
+    let moved = false;
+    const line = i => Array.from({length:N}, (_, j) => dir < 2 ? [i, dir === 0 ? j : N-1-j] : [dir === 2 ? j : N-1-j, i]);
+    const absorbed = [];
+    for (let i = 0; i < N; i++) {
+      const cells = line(i), items = cells.map(([r,c]) => grid[r][c]).filter(Boolean), out = [];
+      for (let k = 0; k < items.length; k++) {
+        if (k + 1 < items.length && items[k].v === items[k+1].v) {
+          const keep = items[k]; keep.v *= 2; keep.merged = true; score += keep.v;
+          absorbed.push([items[k+1], out.length]); out.push(keep); k++;
+          if (keep.v === 2048 && !won) { won = true; setTimeout(() => show("Geschafft! 🎉", "Weiterspielen"), 250); }
+        } else out.push(items[k]);
+      }
+      cells.forEach(([r,c], j) => { const t = out[j] || null; if (grid[r][c] !== t) moved = true; grid[r][c] = t; });
+      // verschmolzene Kachel noch kurz an die Zielposition gleiten lassen
+      absorbed.splice(0).forEach(([t, j]) => { const el = tiles.get(t.id); if (!el) return;
+        const [r,c] = cells[j], { pad, gap, size } = geometry();
+        el.style.transform = `translate(${pad + c*(size+gap)}px, ${pad + r*(size+gap)}px)`; el.style.zIndex = 0;
+        tiles.delete(t.id); setTimeout(() => el.remove(), 120); });
+    }
+    if (!moved) return;
+    addRandom(); render(); save();
+    if (!canMove()) setTimeout(() => show("Keine Züge mehr", "Nochmal"), 250);
+  }
+  function canMove() {
+    for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) {
+      const v = grid[r][c] && grid[r][c].v; if (!v) return true;
+      if (c+1 < N && grid[r][c+1] && grid[r][c+1].v === v) return true;
+      if (r+1 < N && grid[r+1][c] && grid[r+1][c].v === v) return true;
+    }
+    return false;
+  }
+  function show(text, label) { msg.textContent = text; document.getElementById("again").textContent = label;
+                               overlay.classList.add("show"); }
+  document.getElementById("again").onclick = () => {
+    if (won && canMove() && msg.textContent.startsWith("Geschafft")) { overlay.classList.remove("show"); wrap.focus(); }
+    else { store.set("kachelfusion-state", ""); start(); }
+  };
+  document.getElementById("new").onclick = () => { store.set("kachelfusion-state", ""); start(); };
+  const KEYS = { ArrowLeft:0, ArrowRight:1, ArrowUp:2, ArrowDown:3, a:0, d:1, w:2, s:3, A:0, D:1, W:2, S:3 };
+  wrap.addEventListener("keydown", e => { if (e.key in KEYS) { e.preventDefault(); move(KEYS[e.key]); } });
+  board.addEventListener("pointerdown", () => wrap.focus());
+  let sx = 0, sy = 0;
+  board.addEventListener("touchstart", e => { sx = e.touches[0].clientX; sy = e.touches[0].clientY; }, {passive:true});
+  board.addEventListener("touchend", e => {
+    const dx = e.changedTouches[0].clientX - sx, dy = e.changedTouches[0].clientY - sy;
+    if (Math.max(Math.abs(dx), Math.abs(dy)) < 25) return;
+    move(Math.abs(dx) > Math.abs(dy) ? (dx < 0 ? 0 : 1) : (dy < 0 ? 2 : 3));
+  });
+  window.addEventListener("resize", render);
+  window.__game = { move, state: () => ({ grid: grid.map(r => r.map(t => t ? t.v : 0)), score }) };
+  let saved = null; try { saved = JSON.parse(store.get("kachelfusion-state") || "null"); } catch(e) {}
+  start(saved && saved.grid ? saved : null);
+})();
+</script></body></html>
+"""
+
+
+def render_game() -> None:
+    st.caption("Kurze Pause gefällig? Die Aufnahme läuft im Hintergrund weiter, auch wenn du hier spielst. "
+               "Einmal ins Spielfeld klicken, dann mit den Pfeiltasten spielen.")
+    components.html(GAME_HTML, height=560)
+
+
+# ---------------------------------------------------------------------------
 # Oberfläche
 # ---------------------------------------------------------------------------
 st.title("🎓 Gesprächsnotiz-AI")
@@ -1307,7 +1478,7 @@ with st.sidebar:
     st.caption(f"Aufnahmen: `{RECORDINGS_DIR}`")
     st.caption(f"Notizen: `{NOTES_DIR}`")
 
-lecture_tab, file_tab = st.tabs(["🎓 Vorlesung aufnehmen", "📁 Datei auswerten"])
+lecture_tab, file_tab, game_tab = st.tabs(["🎓 Vorlesung aufnehmen", "📁 Datei auswerten", "🎮 Pause"])
 
 recorder = get_recorder()
 live = get_live_processor()
@@ -1464,6 +1635,9 @@ if result:
     if result["transcript"]:
         with st.expander("Vollständiges Transkript"):
             st.text(result["transcript"])
+
+with game_tab:
+    render_game()
 
 with st.expander("Datenschutz und Hinweise"):
     st.markdown(
