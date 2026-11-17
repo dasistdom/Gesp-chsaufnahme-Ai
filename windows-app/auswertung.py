@@ -560,6 +560,8 @@ class Auswerter:
         self.ai_model: Path | None = None
         self.ai_context = 8192
         self.limit_threads = lambda: False  # True, solange eine Aufnahme läuft
+        self.on_part_done: Callable[[str, dict], None] | None = None   # z. B. in Discord teilen
+        self.on_finished: Callable[[str, str, Path], None] | None = None
         self.reset("")
 
     def reset(self, title: str) -> None:
@@ -647,6 +649,8 @@ class Auswerter:
         part["chunks"] = chunks
         part["state"] = "fertig"
         part["status"] = "Fertig" if segments else "Fertig (keine Sprache erkannt)"
+        if self.on_part_done:
+            self.on_part_done(self.title, part)
 
     def _do_final(self) -> None:
         segments = [s for p in self.parts for s in p["segments"]]
@@ -664,3 +668,5 @@ class Auswerter:
         save_session(self.title, created, segments, chunks, summary)
         self.status = "Fertig."
         self.result = {"path": path, "summary": summary}
+        if self.on_finished:
+            self.on_finished(self.title, summary, path)

@@ -26,12 +26,13 @@ from PySide6.QtGui import QColor, QDesktopServices, QFont, QGuiApplication, QIco
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QProgressBar, QPushButton,
-    QSplitter, QStackedWidget, QTextBrowser, QVBoxLayout, QWidget,
+    QScrollArea, QSizePolicy, QSplitter, QStackedWidget, QTextBrowser, QVBoxLayout, QWidget,
 )
 
 import auswertung as aw
 from aufnahme import LoopbackRecorder
 from notizen import list_notes
+from teilen import DiscordShare, is_webhook
 
 APP_NAME = "Gesprächsnotiz-AI"
 DATA_DIR = aw.DATA_DIR  # dieselben Ordner wie die Website-Version
@@ -139,6 +140,15 @@ def open_path(path: Path) -> None:
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
 
+def path_label(path: str) -> QLabel:
+    """Zeigt einen Pfad an, der bei Platzmangel gekürzt wird statt das Fenster zu verbreitern."""
+    widget = label(path, "Muted")
+    widget.setToolTip(path)
+    widget.setMinimumWidth(1)
+    widget.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+    return widget
+
+
 def wav_seconds(path: Path) -> float:
     try:
         with wave.open(str(path), "rb") as wav:
@@ -151,7 +161,7 @@ def wav_seconds(path: Path) -> float:
 class Settings:
     def __init__(self) -> None:
         self.values = {"program_dir": "", "whisper": "base", "model": "", "context": 8192,
-                       "with_mic": False, "split_minutes": 30}
+                       "with_mic": False, "split_minutes": 30, "discord_url": "", "discord_on": False}
         try:
             self.values.update(json.loads(SETTINGS_FILE.read_text(encoding="utf-8")))
         except (OSError, ValueError):
@@ -548,13 +558,23 @@ class NotesPage(QWidget):
 # --- Seite: Einstellungen -------------------------------------------------------
 class SettingsPage(QWidget):
     def __init__(self, settings: Settings, ai_state: AiState, auswerter: aw.Auswerter,
-                 is_busy) -> None:
+                 is_busy, share: DiscordShare) -> None:
         super().__init__()
+        self.share = share
         self.settings = settings
         self.ai_state = ai_state
         self.auswerter = auswerter
         self.is_busy = is_busy
-        root = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        content = QWidget()
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
+        root = QVBoxLayout(content)
         root.setContentsMargins(32, 28, 32, 28)
         root.setSpacing(14)
         root.addWidget(label("Einstellungen", "PageTitle"))
@@ -564,7 +584,7 @@ class SettingsPage(QWidget):
         program_row = QHBoxLayout()
         program_text = QVBoxLayout()
         program_text.addWidget(label("Programmordner von GespraechsnotizAI (KI, Modelle, ffmpeg)"))
-        self.program_label = label("", "Muted", wrap=True)
+        self.program_label = path_label("")
         program_text.addWidget(self.program_label)
         program_row.addLayout(program_text, 1)
         change = QPushButton("Ändern …")
@@ -605,12 +625,35 @@ class SettingsPage(QWidget):
         ai.addLayout(apply_row)
         root.addWidget(ai_box)
 
+        share_box, share_layout = card()
+        share_layout.addWidget(label("Mit der Gruppe teilen (Discord)"))
+        self.share_check = QCheckBox("Notizen automatisch in unseren Discord-Kanal schicken")
+        self.share_check.setChecked(bool(settings["discord_on"]))
+        self.share_check.toggled.connect(lambda v: settings.__setitem__("discord_on", v))
+        share_layout.addWidget(self.share_check)
+        url_row = QHBoxLayout()
+        self.url_edit = QLineEdit(settings["discord_url"])
+        self.url_edit.setPlaceholderText("Webhook-Adresse, beginnt mit https://discord.com/api/webhooks/ …")
+        self.url_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.url_edit.editingFinished.connect(self.save_url)
+        url_row.addWidget(self.url_edit, 1)
+        test_button = QPushButton("Test senden")
+        test_button.clicked.connect(self.send_test)
+        url_row.addWidget(test_button)
+        share_layout.addLayout(url_row)
+        share_layout.addWidget(label("Geteilt werden nur Notizen und Zusammenfassungen – jeder fertige Teil schon "
+                                     "während der Vorlesung, am Ende das Word-Dokument. Keine Aufnahmen, keine "
+                                     "Transkripte. Die Webhook-Adresse nicht öffentlich weitergeben.", "Muted", wrap=True))
+        self.share_label = label("", "Muted", wrap=True)
+        share_layout.addWidget(self.share_label)
+        root.addWidget(share_box)
+
         folders, layout = card()
         for title, path in (("Aufnahmen", RECORDINGS_DIR), ("Notizen", NOTES_DIR)):
             row = QHBoxLayout()
             text = QVBoxLayout()
             text.addWidget(label(title))
-            text.addWidget(label(str(path), "Muted"))
+            text.addWidget(path_label(str(path)))
             row.addLayout(text, 1)
             button = QPushButton("Öffnen")
             button.clicked.connect(lambda _=False, p=path: (p.mkdir(parents=True, exist_ok=True), open_path(p)))
@@ -626,6 +669,7 @@ class SettingsPage(QWidget):
 
     def fill_models(self) -> None:
         self.program_label.setText(str(aw.PROGRAM_DIR) if aw.PROGRAM_DIR else "Nicht gefunden – bitte auswählen.")
+        self.program_label.setToolTip(self.program_label.text())
         self.model_choice.clear()
         models = aw.available_models()
         for model in models:
@@ -663,9 +707,26 @@ class SettingsPage(QWidget):
                 aw.stop_ai()
                 self.ai_state.start(model, self.settings["context"])
 
+    def save_url(self) -> None:
+        url = self.url_edit.text().strip()
+        if url and not is_webhook(url):
+            QMessageBox.warning(self, APP_NAME, "Das ist keine Discord-Webhook-Adresse. Sie beginnt mit "
+                                "https://discord.com/api/webhooks/ – siehe Anleitung.")
+            return
+        self.settings["discord_url"] = url
+
+    def send_test(self) -> None:
+        self.save_url()
+        if not is_webhook(self.settings["discord_url"]):
+            QMessageBox.information(self, APP_NAME, "Bitte zuerst die Webhook-Adresse einfügen.")
+            return
+        self.share.status = "Discord: Test wird gesendet …"
+        self.share.test(self.settings["discord_url"])
+
     def refresh(self) -> None:
         self.ai_label.setText(self.ai_state.text.replace("\n", " · "))
         self.apply_button.setEnabled(not self.ai_state.loading)
+        self.share_label.setText(self.share.status)
 
 
 # --- Hauptfenster ---------------------------------------------------------------
@@ -700,6 +761,9 @@ class MainWindow(QMainWindow):
                 self.settings["program_dir"] = str(found)
         self.auswerter = aw.Auswerter()
         self.ai_state = AiState()
+        self.share = DiscordShare(lambda: self.settings["discord_url"], lambda: bool(self.settings["discord_on"]))
+        self.auswerter.on_part_done = self.share.part_done
+        self.auswerter.on_finished = self.share.finished
 
         central = QWidget()
         layout = QHBoxLayout(central)
@@ -727,7 +791,8 @@ class MainWindow(QMainWindow):
         self.record_page = RecordPage(colors, self.settings, self.auswerter)
         self.notes_page = NotesPage()
         self.settings_page = SettingsPage(self.settings, self.ai_state, self.auswerter,
-                                          lambda: self.record_page.recorder.running or self.auswerter.busy)
+                                          lambda: self.record_page.recorder.running or self.auswerter.busy,
+                                          self.share)
         self.pages.addWidget(self.record_page)
         self.pages.addWidget(self.notes_page)
         self.pages.addWidget(self.settings_page)
@@ -737,7 +802,8 @@ class MainWindow(QMainWindow):
         self.nav.currentRowChanged.connect(self.switch_page)
         self.nav.setCurrentRow(0)
         status_timer = QTimer(self)
-        status_timer.timeout.connect(lambda: self.ai_label.setText(self.ai_state.text))
+        status_timer.timeout.connect(lambda: self.ai_label.setText(
+            self.ai_state.text + ("\nTeilen in Discord: an" if self.share.active else "")))
         status_timer.start(500)
         if start_ai:
             self.settings_page.apply()  # KI im Hintergrund vorladen, damit sie bereit ist, wenn Teil 1 fertig ist
