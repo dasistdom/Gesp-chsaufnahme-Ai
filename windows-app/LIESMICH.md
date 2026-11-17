@@ -11,6 +11,7 @@ Die bisherige Website-Version (`app.py`) bleibt unverändert und funktioniert we
 | **Auswertung** | Jeder fertige Teil (bei Pause oder nach X Minuten) wird **sofort im Hintergrund** ausgewertet: Spracherkennung (Whisper) + Lernnotizen (lokale KI). Nach dem Stoppen entsteht automatisch das Word-Dokument. Auch vorhandene Aufnahmen (.wav) lassen sich auswerten. |
 | **Teilen** | Notizen automatisch in euren **Discord-Kanal** schicken – jeder fertige Teil schon während der Vorlesung, am Ende Zusammenfassung + Word-Dokument. Keine Aufnahmen, keine Transkripte. |
 | **Notizen** | Alle Word-Notizen auflisten, durchsuchen, ansehen und in Word öffnen |
+| **Claude (kostenlos, von Hand)** | „Für Claude kopieren“ kopiert Transkript + fertige Anweisung und öffnet claude.ai; Antwort kopieren und „Claude-Antwort speichern“ → Word-Dokument bei den Notizen, optional in Discord teilen. Mit Gratis-Konto kostenlos (Tageslimit). Der Text geht dabei an Anthropic. |
 | **Einstellungen** | KI-Modell (z. B. Qwen 3 8B), Kontextgröße, Spracherkennung, Programmordner; werden gespeichert |
 
 Die KI, die Modelle und ffmpeg kommen aus der **vorhandenen GespraechsnotizAI-Installation**. Liegt dieser
@@ -38,6 +39,7 @@ Die Webhook-Adresse ist wie ein Schlüssel zum Kanal: nicht öffentlich teilen u
 - `auswertung.py` – Spracherkennung, KI und Word-Export, aus `app.py` übernommen (gleiche Qualität wie die Website)
 - `notizen.py` – liest `.docx`-Dateien für Vorschau und Suche
 - `teilen.py` – schickt Notizen über einen Discord-Webhook
+- `claude_chat.py` – Anweisung für claude.ai bauen und Claudes Antwort als Word-Dokument speichern
 
 ## Nächste Schritte (siehe Fahrplan)
 1. ⭐ „Wichtig“-Knopf während der Vorlesung

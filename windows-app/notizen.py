@@ -26,6 +26,22 @@ class Notiz:
     def text(self) -> str:
         return "\n".join(t for _, t in self.paragraphs)
 
+    @property
+    def transcript(self) -> str:
+        """Der Abschnitt „Vollständiges Transkript“ des Word-Dokuments (leer, wenn es keinen gibt)."""
+        lines, inside = [], False
+        for style, text in self.paragraphs:
+            if style.startswith("Heading") or style == "Title":
+                inside = text.strip() == "Vollständiges Transkript"
+                continue
+            if inside and not text.startswith("„Du“ ="):  # Erklärzeile zu den Sprechern überspringen
+                lines.append(text)
+        return "\n".join(lines)
+
+    @property
+    def has_speakers(self) -> bool:
+        return "] Du: " in self.transcript
+
     def matches(self, query: str) -> bool:
         query = query.strip().lower()
         return not query or query in self.title.lower() or query in self.text.lower()

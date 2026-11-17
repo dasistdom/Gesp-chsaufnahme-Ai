@@ -44,7 +44,8 @@ if sys.stdout is None or sys.stderr is None:
 
 import auswertung as aw  # noqa: E402
 from aufnahme import LoopbackRecorder  # noqa: E402
-from notizen import list_notes  # noqa: E402
+from notizen import Notiz, list_notes, read_docx  # noqa: E402
+import claude_chat  # noqa: E402
 from teilen import DiscordShare, is_webhook  # noqa: E402
 
 APP_NAME = "Gesprächsnotiz-AI"
@@ -160,6 +161,29 @@ def path_label(path: str) -> QLabel:
     widget.setMinimumWidth(1)
     widget.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
     return widget
+
+
+def copy_for_claude(docx_path: Path) -> str:
+    """Kopiert Anweisung + Transkript für claude.ai in die Zwischenablage und öffnet claude.ai."""
+    try:
+        paragraphs = read_docx(docx_path)
+    except Exception as exc:
+        return f"Die Notiz konnte nicht gelesen werden: {exc}"
+    title = next((t for s, t in paragraphs if s == "Title"), docx_path.stem)
+    note = Notiz(docx_path, title, dt.datetime.fromtimestamp(docx_path.stat().st_mtime), paragraphs)
+    if not note.transcript.strip():
+        return ("Diese Notiz enthält kein Transkript (z. B. eine schon von Claude erstellte Notiz). "
+                "Bitte die ursprüngliche Vorlesungsnotiz wählen.")
+    prompt = claude_chat.build_prompt(note.title, note.modified, note.transcript, note.has_speakers)
+    QGuiApplication.clipboard().setText(prompt)
+    QDesktopServices.openUrl(QUrl(claude_chat.CLAUDE_URL))
+    message = (f"Kopiert ({len(prompt):,} Zeichen). claude.ai wurde geöffnet: dort mit Strg+V einfügen und "
+               "absenden. Danach Claudes Antwort mit dem Kopieren-Knopf unter der Antwort kopieren und unter "
+               "„Notizen“ auf „Claude-Antwort speichern“ klicken.").replace(",", ".", 1)
+    if len(prompt) > claude_chat.LARGE_PROMPT:
+        message += (" Hinweis: Der Text ist sehr lang – mit einem Gratis-Konto kann das Tageslimit erreicht "
+                    "werden. Dann eine kürzere Aufnahme bzw. einen einzelnen Teil verwenden.")
+    return message
 
 
 def wav_seconds(path: Path) -> float:
@@ -337,6 +361,12 @@ class RecordPage(QWidget):
         self.open_result_button.setVisible(False)
         self.open_result_button.clicked.connect(self.open_result)
         result_row.addWidget(self.open_result_button)
+        self.claude_result_button = QPushButton("Für Claude kopieren")
+        self.claude_result_button.setToolTip("Kopiert das Transkript mit einer Anweisung für claude.ai (kostenlos, von Hand).")
+        self.claude_result_button.setVisible(False)
+        self.claude_result_button.clicked.connect(
+            lambda: self.auswerter.result and self._show_info(copy_for_claude(Path(self.auswerter.result["path"]))))
+        result_row.addWidget(self.claude_result_button)
         control_layout.addLayout(result_row)
         body.addWidget(control, 1)
 
@@ -369,6 +399,8 @@ class RecordPage(QWidget):
         name = f"{dt.datetime.now():%Y-%m-%d_%H%M}_{safe_filename(title)}.wav"
         self.parts_list.clear()
         self.open_result_button.setVisible(False)
+        self.claude_result_button.setVisible(False)
+        self._info = ""
         self.auswerter.reset(title)
         self.recorder.start(RECORDINGS_DIR / name, with_mic=self.mic_check.isChecked(),
                             auto_split_minutes=self.split_choice.currentData(),
@@ -403,6 +435,8 @@ class RecordPage(QWidget):
                                                            paths[0].stem).replace("_", " ")
         self.parts_list.clear()
         self.open_result_button.setVisible(False)
+        self.claude_result_button.setVisible(False)
+        self._info = ""
         self.auswerter.reset(title)
         offset = 0.0
         for number, path in enumerate(paths, start=1):
@@ -410,6 +444,11 @@ class RecordPage(QWidget):
             offset += wav_seconds(path)
         self.auswerter.finish()
         self._update_buttons()
+
+    def _show_info(self, text: str) -> None:
+        self._info = text
+        self.hint.setObjectName("Muted")
+        self.hint.setText(text)
 
     def open_result(self) -> None:
         if self.auswerter.result:
@@ -475,8 +514,9 @@ class RecordPage(QWidget):
             self.hint.setText(ev.error)
         elif ev.result:
             self.hint.setObjectName("Result")
-            self.hint.setText(f"Fertig! Notizen gespeichert: {Path(ev.result['path']).name}")
+            self.hint.setText(getattr(self, "_info", "") or f"Fertig! Notizen gespeichert: {Path(ev.result['path']).name}")
             self.open_result_button.setVisible(True)
+            self.claude_result_button.setVisible(True)
             if self._shown_result is not ev.result:
                 self._shown_result = ev.result
                 self._update_buttons()
@@ -499,8 +539,9 @@ class RecordPage(QWidget):
 
 # --- Seite: Notizen -------------------------------------------------------------
 class NotesPage(QWidget):
-    def __init__(self) -> None:
+    def __init__(self, share: DiscordShare | None = None) -> None:
         super().__init__()
+        self.share = share
         self.notes = []
         self.visible = []
         root = QVBoxLayout(self)
@@ -529,10 +570,27 @@ class NotesPage(QWidget):
         right_layout.setContentsMargins(0, 0, 0, 0)
         self.preview = QTextBrowser()
         right_layout.addWidget(self.preview, 1)
+        self.info = label("", "Muted", wrap=True)
+        self.info.setVisible(False)
+        right_layout.addWidget(self.info)
+        buttons = QHBoxLayout()
+        self.claude_button = QPushButton("Für Claude kopieren")
+        self.claude_button.setToolTip("Kopiert das Transkript mit einer fertigen Anweisung und öffnet claude.ai "
+                                      "(kostenlos mit einem Gratis-Konto).")
+        self.claude_button.clicked.connect(self.copy_current_for_claude)
+        buttons.addWidget(self.claude_button)
+        self.save_claude_button = QPushButton("Claude-Antwort speichern")
+        self.save_claude_button.setToolTip("Speichert die kopierte Antwort von claude.ai als Word-Dokument bei den Notizen.")
+        self.save_claude_button.clicked.connect(self.save_claude_answer)
+        buttons.addWidget(self.save_claude_button)
+        self.share_claude = QCheckBox("auch in Discord teilen")
+        buttons.addWidget(self.share_claude)
+        buttons.addStretch()
         self.open_button = QPushButton("In Word öffnen")
         self.open_button.setObjectName("Primary")
         self.open_button.clicked.connect(self.open_current)
-        right_layout.addWidget(self.open_button, 0, Qt.AlignmentFlag.AlignRight)
+        buttons.addWidget(self.open_button)
+        right_layout.addLayout(buttons)
         splitter.addWidget(right)
         splitter.setSizes([320, 680])
         root.addWidget(splitter, 1)
@@ -540,6 +598,39 @@ class NotesPage(QWidget):
     def reload(self) -> None:
         self.notes = list_notes(NOTES_DIR)
         self.fill_list()
+        self.share_claude.setVisible(bool(self.share and self.share.active))
+
+    def show_info(self, text: str) -> None:
+        self.info.setText(text)
+        self.info.setVisible(bool(text))
+
+    def copy_current_for_claude(self) -> None:
+        row = self.list.currentRow()
+        if 0 <= row < len(self.visible):
+            self.show_info(copy_for_claude(self.visible[row].path))
+
+    def save_claude_answer(self) -> None:
+        text = QGuiApplication.clipboard().text()
+        if not claude_chat.looks_like_answer(text):
+            self.show_info("In der Zwischenablage ist noch keine Antwort von Claude. Auf claude.ai unter der "
+                           "Antwort auf „Kopieren“ klicken und dann erneut hier speichern.")
+            return
+        row = self.list.currentRow()
+        original = self.visible[row].path if 0 <= row < len(self.visible) else NOTES_DIR / "Vorlesung.docx"
+        try:
+            path, title = claude_chat.save_answer(text, original, NOTES_DIR)
+        except Exception as exc:
+            self.show_info(f"Konnte nicht gespeichert werden: {exc}")
+            return
+        shared = ""
+        if self.share_claude.isChecked() and self.share and self.share.active:
+            self.share.finished(title, text, path)
+            shared = " und in Discord geteilt"
+        self.reload()
+        for index, note in enumerate(self.visible):
+            if note.path == path:
+                self.list.setCurrentRow(index)
+        self.show_info(f"Gespeichert{shared}: {path.name}")
 
     def fill_list(self) -> None:
         query = self.search.text()
@@ -558,6 +649,7 @@ class NotesPage(QWidget):
                 "Noch keine Notizen. Sobald eine Vorlesung ausgewertet ist, erscheint sie hier.")
             self.preview.setHtml(f"<p style='color:gray'>{text}</p>")
         self.open_button.setEnabled(bool(self.visible))
+        self.claude_button.setEnabled(bool(self.visible))
 
     def show_note(self, row: int) -> None:
         if 0 <= row < len(self.visible):
@@ -803,7 +895,7 @@ class MainWindow(QMainWindow):
 
         self.pages = QStackedWidget()
         self.record_page = RecordPage(colors, self.settings, self.auswerter)
-        self.notes_page = NotesPage()
+        self.notes_page = NotesPage(self.share)
         self.settings_page = SettingsPage(self.settings, self.ai_state, self.auswerter,
                                           lambda: self.record_page.recorder.running or self.auswerter.busy,
                                           self.share)
