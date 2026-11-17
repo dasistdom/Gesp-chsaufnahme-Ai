@@ -1,0 +1,34 @@
+﻿GESPRÄCHSNOTIZ-AI ALS APP-FENSTER (DEMO)
+========================================
+
+Was ist das?
+Die Oberfläche läuft in einem eigenen Fenster statt im Browser-Tab – ohne Adressleiste,
+ohne Tabs und ohne schwarzes Konsolenfenster. Portabel, keine Installation nötig.
+Die normale Version (GespraechsnotizAI.exe, Anzeige im Browser) funktioniert weiterhin.
+
+Einrichten
+1. Diese drei Dateien in den Ordner kopieren, in dem auch START_HIER.txt liegt:
+     App-Fenster-starten.ps1
+     App-Fenster-Verknuepfung-erstellen.ps1
+     App-Fenster-Verknuepfung-erstellen.bat
+2. Doppelklick auf "App-Fenster-Verknuepfung-erstellen.bat".
+   Auf dem Desktop erscheint "Gespraechsnotiz-AI (App)".
+3. Über diese Verknüpfung starten. Ein kleines Fenster zeigt an, dass die KI lädt;
+   danach öffnet sich die App in einem eigenen Fenster.
+
+Beenden
+Einfach das App-Fenster schließen – das Programm und der KI-Server werden mit beendet.
+Achtung: Eine laufende Aufnahme vorher stoppen.
+
+Wie es funktioniert
+- GespraechsnotizAI.exe wird unsichtbar gestartet, auf Port 8517
+  (die Browser-Version nutzt 8501, beide stören sich nicht).
+- Microsoft Edge (sonst Chrome) zeigt die Oberfläche im "App-Modus" an.
+- Das Skript wartet, bis das Fenster geschlossen wird, und beendet dann alles.
+
+Wenn etwas nicht klappt
+- Protokoll: %LOCALAPPDATA%\GespraechsnotizAI\app-fenster.log
+- Windows-Warnung oder PowerShell-Skripte gesperrt (z. B. auf Firmen-PCs):
+  dann bitte normal GespraechsnotizAI.exe nutzen.
+- Nicht gleichzeitig mit der Browser-Version eine Vorlesung auswerten – beide teilen
+  sich den Prozessor.
