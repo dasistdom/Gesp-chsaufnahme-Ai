@@ -104,7 +104,7 @@ _HALLUCINATIONS = re.compile(r"untertitel|amara\.org|copyright|www\.", re.IGNORE
 def transcribe_with(model, path: str) -> list[dict]:
     """Gibt eine Liste von Abschnitten mit Start-/Endzeit und Text zurück."""
     result = model.transcribe(
-        path, language="de", fp16=False, verbose=False,
+        path, language="de", fp16=False, verbose=None,  # None: kein Fortschrittsbalken (ohne Konsole würde er abstürzen)
         condition_on_previous_text=False,  # verhindert Endlosschleifen bei Pausen
     )
     segments = []
@@ -738,7 +738,10 @@ class Auswerter:
         segments = [s for p in self.parts for s in p["segments"]]
         chunks = [c for p in self.parts for c in p["chunks"]]
         if not chunks:
-            self.error = "In der Aufnahme wurde keine Sprache erkannt."
+            failed = [p for p in self.parts if p["state"] == "fehler"]
+            self.error = (f"Die Auswertung ist bei {len(failed)} Teil(en) fehlgeschlagen (siehe oben). Die Aufnahme "
+                          "ist gespeichert und kann mit „Vorhandene Aufnahme auswerten …“ erneut ausgewertet werden."
+                          if failed else "In der Aufnahme wurde keine Sprache erkannt.")
             return
         self._ensure_ai(lambda t: setattr(self, "status", t))
         summary = summarize_parts(chunks, self.title, lambda v, t: setattr(self, "status", t))

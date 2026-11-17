@@ -29,10 +29,23 @@ from PySide6.QtWidgets import (
     QScrollArea, QSizePolicy, QSplitter, QStackedWidget, QTextBrowser, QVBoxLayout, QWidget,
 )
 
-import auswertung as aw
-from aufnahme import LoopbackRecorder
-from notizen import list_notes
-from teilen import DiscordShare, is_webhook
+# Ohne Konsolenfenster (pythonw.exe) gibt es keine Textausgabe: sys.stdout/sys.stderr sind None und jedes
+# print oder jeder Fortschrittsbalken würde abstürzen. Deshalb alles in eine Log-Datei umleiten – noch bevor
+# Bausteine wie Whisper geladen werden.
+if sys.stdout is None or sys.stderr is None:
+    _log_dir = Path.home() / "Documents" / "GespraechsnotizAI"
+    try:
+        _log_dir.mkdir(parents=True, exist_ok=True)
+        _log = open(_log_dir / "windows-app.log", "a", encoding="utf-8", buffering=1)
+    except OSError:
+        _log = open(os.devnull, "w", encoding="utf-8")
+    sys.stdout = sys.stdout or _log
+    sys.stderr = sys.stderr or _log
+
+import auswertung as aw  # noqa: E402
+from aufnahme import LoopbackRecorder  # noqa: E402
+from notizen import list_notes  # noqa: E402
+from teilen import DiscordShare, is_webhook  # noqa: E402
 
 APP_NAME = "Gesprächsnotiz-AI"
 DATA_DIR = aw.DATA_DIR  # dieselben Ordner wie die Website-Version
