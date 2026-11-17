@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 """Aufnahme von Systemton (WASAPI-Loopback) und optional Mikrofon – ohne Zusatz-Bibliotheken.
 
+Mit Mikrofon wird in Stereo gespeichert: links Lautsprecher (Lehrkraft/Kurs), rechts Mikrofon (du).
+So lässt sich später erkennen, wer gerade spricht. Die Spracherkennung hört beide Kanäle zusammen.
+
 Übernommen aus app.py (Website-Version), damit das Windows-Programm dieselbe,
 bereits getestete Aufnahme-Technik nutzt. Später sollen beide Versionen dieses Modul teilen.
 """
@@ -184,7 +187,8 @@ class LoopbackRecorder:
         self.levels: dict[str, float] = {}
         self.errors: dict[str, str] = {}
         self.formats: dict[str, str] = {}
-        self._timeline = _Timeline()
+        self._timeline = _Timeline()       # Lautsprecher
+        self._mic_timeline = _Timeline()   # Mikrofon (eigener Kanal)
         self._t0 = 0
         self._skips: list[list] = []      # Zeitbereiche [start, ende) ohne Aufnahme (Pausen)
         self._split_at: int | None = None  # Index, an dem der aktuelle Teil endet
@@ -229,7 +233,8 @@ class LoopbackRecorder:
         self._skips = []
         self._split_at = None
         self.started_at = time.time()
-        self._timeline = _Timeline()
+        self._timeline = _Timeline()       # Lautsprecher
+        self._mic_timeline = _Timeline()   # Mikrofon (eigener Kanal)
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, name="recorder", daemon=True)
         self._thread.start()
@@ -265,7 +270,7 @@ class LoopbackRecorder:
         self.part_samples = 0
         self.path = self.base_path.with_name(f"{self.base_path.stem}_Teil{self.part_number:02d}.wav")
         wav = wave.open(str(self.path), "wb")
-        wav.setnchannels(1)
+        wav.setnchannels(2 if self.with_mic else 1)
         wav.setsampwidth(2)
         wav.setframerate(RECORD_RATE)
         return wav
@@ -303,7 +308,7 @@ class LoopbackRecorder:
                 if stopping:
                     for thread in sources:
                         thread.join(timeout=5)
-                    target = max(self._timeline.end, self._now_index())
+                    target = max(self._timeline.end, self._mic_timeline.end, self._now_index())
                 else:
                     target = self._now_index() - lag
 
@@ -332,6 +337,7 @@ class LoopbackRecorder:
     def _flush(self, wav: wave.Wave_write, upto: int) -> None:
         start = self._timeline.base
         audio = self._timeline.take(upto)
+        mic = self._mic_timeline.take(upto)  # gleich lang: beide Zeitachsen laufen im Gleichschritt
         if not len(audio):
             return
         keep = np.ones(len(audio), dtype=bool)
@@ -344,10 +350,14 @@ class LoopbackRecorder:
         audio = audio[keep]
         if not len(audio):
             return
-        pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype("<i2")
+        if self.with_mic:  # Stereo: links Lautsprecher, rechts Mikrofon
+            frames = np.column_stack((audio, mic[keep])).ravel()
+        else:
+            frames = audio
+        pcm = (np.clip(frames, -1.0, 1.0) * 32767).astype("<i2")
         wav.writeframes(pcm.tobytes())  # Dateikopf wird dabei laufend aktualisiert
-        self.samples_written += len(pcm)
-        self.part_samples += len(pcm)
+        self.samples_written += len(audio)
+        self.part_samples += len(audio)
 
     # -- Aufnahme-Threads (je Quelle einer) ---------------------------------
     def _source_loop(self, source: str) -> None:
@@ -450,7 +460,8 @@ class LoopbackRecorder:
                         self.levels[source] = 0.0 if self.paused else level
                         if level > 1e-4 and not self.paused:
                             self.got_audio = True
-                        self._timeline.add(int(index), out)
+                        timeline = self._mic_timeline if source == "mic" else self._timeline
+                        timeline.add(int(index), out)
                     _check(get_next(capture, ctypes.byref(packet)), "Audiodaten abfragen")
 
             _com_method(client, 11)(client)  # IAudioClient::Stop

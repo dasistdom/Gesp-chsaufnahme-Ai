@@ -232,7 +232,11 @@ Fachbegriffe:
 Aufgaben/Termine:
 - nur wenn im Text eine Aufgabe, Frist oder ein Termin genannt wird
 
-Lass „Fachbegriffe“ oder „Aufgaben/Termine“ komplett weg, wenn es dazu nichts gibt.
+Fragen aus dem Kurs:
+- nur wenn Zeilen mit „Du:“ vorkommen: Das sind Fragen oder Beiträge der Person, die mitschreibt.
+  Schreibe wichtige davon als „Frage: … – Antwort: …“ mit der Antwort der Lehrkraft.
+
+Lass „Fachbegriffe“, „Aufgaben/Termine“ oder „Fragen aus dem Kurs“ komplett weg, wenn es dazu nichts gibt.
 Schreibe die Anweisungen selbst nicht ab und wiederhole keinen Punkt."""
 
 SUMMARY_INSTRUCTIONS = """Erstelle daraus eine Zusammenfassung mit genau diesen Überschriften:
@@ -247,7 +251,11 @@ SUMMARY_INSTRUCTIONS = """Erstelle daraus eine Zusammenfassung mit genau diesen 
 Höchstens 10 echte Fachbegriffe, jeweils „Begriff – Erklärung“. Keine Wiederholungen.
 
 ## Aufgaben und Termine
-Nur was ausdrücklich genannt wurde, sonst „Keine genannt“."""
+Nur was ausdrücklich genannt wurde, sonst „Keine genannt“.
+
+## Fragen und Antworten
+Nur wenn die Notizen Einträge der Form „Frage: … – Antwort: …“ enthalten: diese hier sammeln.
+Sonst diese Überschrift weglassen."""
 
 
 def ask_ai(prompt: str, max_tokens: int) -> str:
@@ -368,10 +376,69 @@ def chunk_segments(segments: list[dict], limit: int | None = None) -> list[dict]
     return [
         {
             "label": f"{fmt_time(c[0]['start'])} – {fmt_time(c[-1]['end'])}",
-            "text": " ".join(s["text"] for s in c),
+            "text": speaker_text(c),
         }
         for c in chunks
     ]
+
+
+def speaker_text(segments: list[dict]) -> str:
+    """Fügt Abschnitte zusammen; mit Sprecher-Erkennung beginnt jeder Sprecherwechsel mit „Du:“ bzw. „Lehrkraft:“."""
+    if not any(s.get("speaker") for s in segments):
+        return " ".join(s["text"] for s in segments)
+    lines, current, words = [], None, []
+    for seg in segments:
+        speaker = seg.get("speaker") or "Lehrkraft"
+        if speaker != current and words:
+            lines.append(f"{current}: {' '.join(words)}")
+            words = []
+        current = speaker
+        words.append(seg["text"])
+    if words:
+        lines.append(f"{current}: {' '.join(words)}")
+    return "\n".join(lines)
+
+
+def label_speakers(path: str, segments: list[dict]) -> bool:
+    """Kennzeichnet Abschnitte mit „Du“ oder „Lehrkraft“ anhand der zwei Kanäle einer Stereo-Aufnahme.
+
+    Links liegt der Lautsprecher-Ton (Lehrkraft und Kurs), rechts das eigene Mikrofon. Spricht man selbst,
+    ist das Mikrofon laut und der Lautsprecher still. Gibt False zurück, wenn die Datei kein Stereo ist.
+    """
+    import wave
+    import numpy as np
+    try:
+        with wave.open(path, "rb") as wav:
+            if wav.getnchannels() != 2 or wav.getsampwidth() != 2:
+                return False
+            rate = wav.getframerate()
+            data = np.frombuffer(wav.readframes(wav.getnframes()), dtype="<i2").reshape(-1, 2)
+    except (OSError, wave.Error, EOFError):
+        return False
+    hop = max(1, rate // 20)  # Lautstärke in 50-ms-Stücken
+    usable = len(data) - len(data) % hop
+    if not usable:
+        return False
+    frames = data[:usable].astype(np.float32).reshape(-1, hop, 2) / 32768.0
+    rms = np.sqrt(np.mean(frames ** 2, axis=1))  # (Stücke, 2)
+
+    def typical(channel: np.ndarray) -> float:
+        active = channel[channel > 1e-3]
+        return float(np.percentile(active, 75)) if len(active) else 1.0
+
+    speaker_ref, mic_ref = typical(rms[:, 0]), typical(rms[:, 1])
+    for seg in segments:
+        lo, hi = int(seg["start"] * 20), max(int(seg["start"] * 20) + 1, int(seg["end"] * 20))
+        window = rms[lo:hi]
+        if not len(window):
+            seg["speaker"] = "Lehrkraft"
+            continue
+        speaker_level = float(np.mean(window[:, 0])) / speaker_ref
+        mic_level = float(np.mean(window[:, 1])) / mic_ref
+        mine = (mic_level > 0.4 and mic_level > 2.5 * speaker_level) \
+            or (speaker_level < 0.1 and mic_level > 0.15)  # leise gesprochen, aber Lautsprecher still
+        seg["speaker"] = "Du" if mine else "Lehrkraft"
+    return True
 
 
 def write_notes(parts: list[dict], title: str, progress: Callable[[float, str], None]) -> None:
@@ -482,14 +549,27 @@ def build_docx(title: str, summary: str, parts: list[dict], segments: list[dict]
     if segments:
         doc.add_page_break()
         doc.add_heading("Vollständiges Transkript", level=1)
-        paragraph_start, buffer = segments[0]["start"], []
+        with_speakers = any(s.get("speaker") for s in segments)
+        if with_speakers:
+            note = doc.add_paragraph("„Du“ = eigenes Mikrofon, „Lehrkraft“ = Ton aus der Vorlesung "
+                                     "(dazu gehören auch Beiträge anderer Teilnehmender).")
+            note.runs[0].italic = True
+
+        def flush(start: float, speaker: str | None, words: list[str]) -> None:
+            paragraph = doc.add_paragraph(f"[{fmt_time(start)}] ")
+            if speaker:
+                paragraph.add_run(f"{speaker}: ").bold = True
+            paragraph.add_run(" ".join(words))
+
+        paragraph_start, speaker, buffer = segments[0]["start"], segments[0].get("speaker"), []
         for seg in segments:
+            if buffer and (seg.get("speaker") != speaker or seg["start"] - paragraph_start >= 60):
+                flush(paragraph_start, speaker, buffer)
+                paragraph_start, buffer = seg["start"], []
+            speaker = seg.get("speaker")
             buffer.append(seg["text"])
-            if seg["end"] - paragraph_start >= 60:
-                doc.add_paragraph(f"[{fmt_time(paragraph_start)}] " + " ".join(buffer))
-                paragraph_start, buffer = seg["end"], []
         if buffer:
-            doc.add_paragraph(f"[{fmt_time(paragraph_start)}] " + " ".join(buffer))
+            flush(paragraph_start, speaker, buffer)
 
     out = io.BytesIO()
     doc.save(out)
@@ -639,6 +719,8 @@ class Auswerter:
         part["state"], part["status"] = "läuft", "Spracherkennung läuft …"
         self._limit_cpu()
         segments = transcribe_with(self._model(), str(part["path"]))
+        if segments and label_speakers(str(part["path"]), segments):
+            part["status"] = "Sprecher erkannt …"
         for seg in segments:
             seg["start"] += part["offset"]
             seg["end"] += part["offset"]

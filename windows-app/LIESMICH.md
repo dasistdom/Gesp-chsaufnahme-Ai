@@ -7,6 +7,7 @@ Die bisherige Website-Version (`app.py`) bleibt unverändert und funktioniert we
 | Bereich | Funktion |
 |---|---|
 | **Aufnehmen** | Systemton (z. B. LearnSpace3D) und optional Mikrofon aufnehmen, Pause/Weiter, automatisch neue Teile alle X Minuten, Pegelanzeige |
+| **Wer spricht?** | Mit Mikrofon wird in Stereo aufgenommen (links Lautsprecher, rechts Mikrofon). Das Transkript kennzeichnet „Du:“ und „Lehrkraft:“; deine Fragen landen als „Frage: … – Antwort: …“ in den Notizen und unter „Fragen und Antworten“ in der Zusammenfassung. |
 | **Auswertung** | Jeder fertige Teil (bei Pause oder nach X Minuten) wird **sofort im Hintergrund** ausgewertet: Spracherkennung (Whisper) + Lernnotizen (lokale KI). Nach dem Stoppen entsteht automatisch das Word-Dokument. Auch vorhandene Aufnahmen (.wav) lassen sich auswerten. |
 | **Teilen** | Notizen automatisch in euren **Discord-Kanal** schicken – jeder fertige Teil schon während der Vorlesung, am Ende Zusammenfassung + Word-Dokument. Keine Aufnahmen, keine Transkripte. |
 | **Notizen** | Alle Word-Notizen auflisten, durchsuchen, ansehen und in Word öffnen |
@@ -39,9 +40,8 @@ Die Webhook-Adresse ist wie ein Schlüssel zum Kanal: nicht öffentlich teilen u
 - `teilen.py` – schickt Notizen über einen Discord-Webhook
 
 ## Nächste Schritte (siehe Fahrplan)
-1. Lehrkraft und eigene Beiträge im Transkript unterscheiden
-2. ⭐ „Wichtig“-Knopf während der Vorlesung
-3. Quiz und Lernkarten
-4. Unterrichtsmaterial (PowerPoint) hochladen und Notizen darauf abstimmen
-5. Lern-Präsentation erstellen
-6. Portable `.exe` automatisch über GitHub Actions bauen – dann braucht niemand mehr Python
+1. ⭐ „Wichtig“-Knopf während der Vorlesung
+2. Quiz und Lernkarten
+3. Unterrichtsmaterial (PowerPoint) hochladen und Notizen darauf abstimmen
+4. Lern-Präsentation erstellen
+5. Portable `.exe` automatisch über GitHub Actions bauen – dann braucht niemand mehr Python

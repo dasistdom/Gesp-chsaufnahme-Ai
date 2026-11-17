@@ -245,8 +245,9 @@ class RecordPage(QWidget):
         self.title_edit = QLineEdit()
         self.title_edit.setPlaceholderText("z. B. Netzwerktechnik – Subnetting")
         setup_layout.addWidget(self.title_edit)
-        self.mic_check = QCheckBox("Mein Mikrofon auch aufnehmen")
-        self.mic_check.setToolTip("Damit deine Fragen und Beiträge in den Notizen stehen. Am besten mit Headset.")
+        self.mic_check = QCheckBox("Mein Mikrofon auch aufnehmen (erkennt „Du“ und „Lehrkraft“)")
+        self.mic_check.setToolTip("Damit deine Fragen und Beiträge in den Notizen stehen. Das Transkript zeigt dann, "
+                                  "was du gesagt hast („Du:“) und was die Lehrkraft („Lehrkraft:“). Am besten mit Headset.")
         self.mic_check.setChecked(bool(settings["with_mic"]))
         self.mic_check.toggled.connect(lambda v: settings.__setitem__("with_mic", v))
         setup_layout.addWidget(self.mic_check)
