@@ -21,7 +21,7 @@ exit /b 0
 
 :nopython
 echo Python wurde nicht gefunden.
-echo Bitte Python 3.11 oder neuer von https://www.python.org/downloads/ installieren
+echo Bitte Python 3.10 oder neuer von https://www.python.org/downloads/ installieren
 echo und dabei den Haken "Add python.exe to PATH" setzen. Danach diese Datei erneut starten.
 pause
 exit /b 1

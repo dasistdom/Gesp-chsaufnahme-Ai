@@ -14,7 +14,7 @@ Noch **nicht** enthalten: Spracherkennung und KI-Zusammenfassung. Dafür vorerst
 („Ältere Aufnahme auswerten“) – beide verwenden dieselben Ordner unter `Dokumente\GespraechsnotizAI`.
 
 ## Starten (Entwicklung)
-1. Einmalig **Python 3.11+** von python.org installieren (Haken „Add python.exe to PATH“).
+1. Einmalig **Python 3.10+** von python.org installieren (Haken „Add python.exe to PATH“).
 2. Doppelklick auf **`Starten.bat`**. Beim ersten Mal wird automatisch eingerichtet (1–2 Minuten).
 
 ## Aufbau
